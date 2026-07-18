@@ -279,17 +279,10 @@ async def cb_new_reading(call: CallbackQuery, state: FSMContext) -> None:
 async def cb_spread(call: CallbackQuery, state: FSMContext) -> None:
     await _ack(call)
     key = call.data.split(":", 1)[1]
-    if key != "classic" and key not in texts.SPREAD_TITLES:
-        return
-    if config.MINIAPP_URL:
-        # Вопрос и тема задаются прямо в Mini App (payload v2) — сразу к колоде
-        await state.set_state(Reading.waiting_cards)
-        await state.update_data(spread=key, topic_key=None, question="")
-        await call.message.answer(
-            texts.DRAW_MINIAPP, reply_markup=kb.draw_cards_webapp(key))
-        return
     if key == "classic":
         await call.message.answer(texts.ASK_TOPIC, reply_markup=kb.topics())
+        return
+    if key not in texts.SPREAD_TITLES:
         return
     await state.set_state(Reading.waiting_question)
     await state.update_data(spread=key, topic_key=None)
