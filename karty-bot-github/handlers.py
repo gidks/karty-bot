@@ -279,10 +279,17 @@ async def cb_new_reading(call: CallbackQuery, state: FSMContext) -> None:
 async def cb_spread(call: CallbackQuery, state: FSMContext) -> None:
     await _ack(call)
     key = call.data.split(":", 1)[1]
+    if key != "classic" and key not in texts.SPREAD_TITLES:
+        return
+    if config.MINIAPP_URL:
+        # Вопрос и тема задаются прямо в Mini App (payload v2) — сразу к колоде
+        await state.set_state(Reading.waiting_cards)
+        await state.update_data(spread=key, topic_key=None, question="")
+        await call.message.answer(
+            texts.DRAW_MINIAPP, reply_markup=kb.draw_cards_webapp(key))
+        return
     if key == "classic":
         await call.message.answer(texts.ASK_TOPIC, reply_markup=kb.topics())
-        return
-    if key not in texts.SPREAD_TITLES:
         return
     await state.set_state(Reading.waiting_question)
     await state.update_data(spread=key, topic_key=None)
@@ -300,20 +307,35 @@ async def cb_topic(call: CallbackQuery, state: FSMContext) -> None:
     await call.message.answer(texts.ASK_QUESTION[topic_key])
 
 
-def _parse_webapp_cards(raw: str, spread: str) -> list[dict] | None:
-    """Карты, выбранные в Mini App: '{"v":1,"spread":...,"cards":[{"id":..,"rev":0|1}]}'.
-    Любая ошибка формата -> None (тогда бот вытянет сам)."""
+# Сколько карт тянется в каждом раскладе (по умолчанию 3)
+SPREAD_CARDS: dict[str, int] = {"yesno": 1, "week": 7}
+
+
+def _spread_n(spread: str) -> int:
+    return SPREAD_CARDS.get(spread, 3)
+
+
+def _parse_webapp_payload(raw: str, spread: str) -> tuple[list[dict], str, str | None] | None:
+    """Данные из Mini App.
+    v1: '{"v":1,"spread":...,"cards":[{"id":..,"rev":0|1}]}'
+    v2: то же + "q" (вопрос, набранный в аппе) и "topic" (тема для классики).
+    Возвращает (карты, вопрос, topic_key). Любая ошибка формата -> None
+    (тогда бот вытянет сам)."""
     try:
         payload = json.loads(raw)
         chosen = payload["cards"]
-        need = 1 if spread == "yesno" else 3
+        need = _spread_n(spread)
         ids = [int(c["id"]) for c in chosen]
         if len(ids) != need or len(set(ids)) != len(ids):
             return None
         if any(i < 0 or i > 77 for i in ids):
             return None
         by_id = {c["id"]: c for c in cards.CARDS}
-        return [{**by_id[int(c["id"])], "rev": bool(c.get("rev"))} for c in chosen]
+        drawn = [{**by_id[int(c["id"])], "rev": bool(c.get("rev"))} for c in chosen]
+        q = str(payload.get("q") or "").strip()[:500]
+        topic = payload.get("topic")
+        topic_key = topic if isinstance(topic, str) and topic in texts.TOPIC_TITLES else None
+        return drawn, q, topic_key
     except (KeyError, TypeError, ValueError, json.JSONDecodeError):
         return None
 
@@ -332,8 +354,8 @@ async def reading_question(message: Message, state: FSMContext, bot: Bot) -> Non
     if not await _check_readings_available(message, state):
         return
 
-    if config.MINIAPP_URL:
-        data = await state.get_data()
+    data = await state.get_data()
+    if config.MINIAPP_URL and not data.get("no_app"):
         spread = data.get("spread", "classic")
         await state.set_state(Reading.waiting_cards)
         await state.update_data(question=question)
@@ -345,18 +367,45 @@ async def reading_question(message: Message, state: FSMContext, bot: Bot) -> Non
 
 @router.message(Reading.waiting_cards, F.web_app_data)
 async def webapp_cards(message: Message, state: FSMContext, bot: Bot) -> None:
-    """Пользовательница вытянула карты в Mini App."""
+    """Пользовательница вытянула карты в Mini App (вопрос и тема — в payload v2)."""
     data = await state.get_data()
     spread = data.get("spread", "classic")
-    drawn = _parse_webapp_cards(message.web_app_data.data, spread)
-    await _do_reading(message, state, bot, data.get("question", ""), drawn)
+    parsed = _parse_webapp_payload(message.web_app_data.data, spread)
+    if parsed is None:
+        drawn, q, topic_key = None, "", None
+    else:
+        drawn, q, topic_key = parsed
+    question = (q or data.get("question", "")).strip()
+    if topic_key and spread == "classic":
+        await state.update_data(topic_key=topic_key)
+    await _do_reading(message, state, bot, question, drawn)
 
 
 @router.message(Reading.waiting_cards, F.text, ~F.text.startswith("/"))
 async def webapp_fallback(message: Message, state: FSMContext, bot: Bot) -> None:
-    """Кнопка не сработала / написала что угодно — бот тянет карты сам."""
+    """Кнопка не сработала / написала текст вместо Mini App.
+    Длинный текст считаем вопросом и тянем карты сами; короткий («сам») —
+    спрашиваем вопрос в чате и дальше работаем без Mini App."""
     data = await state.get_data()
-    await _do_reading(message, state, bot, data.get("question", ""), drawn=None)
+    text = (message.text or "").strip()
+    stored_q = (data.get("question") or "").strip()
+    if stored_q:
+        # Вопрос уже был задан в чате (старый путь) — просто тянем сами
+        await _do_reading(message, state, bot, stored_q, drawn=None)
+        return
+    if len(text) >= 5:
+        await _do_reading(message, state, bot, text[:500], drawn=None)
+        return
+    # «сам» и прочие короткие ответы: продолжаем в чате без Mini App
+    spread = data.get("spread", "classic")
+    await state.set_state(Reading.waiting_question)
+    await state.update_data(no_app=True)
+    if spread == "classic":
+        prompt = texts.ASK_QUESTION.get(
+            data.get("topic_key") or "own", texts.ASK_QUESTION["own"])
+    else:
+        prompt = texts.ASK_SPREAD_QUESTION.get(spread, texts.ASK_QUESTION["own"])
+    await message.answer(prompt, reply_markup=ReplyKeyboardRemove())
 
 
 async def _check_readings_available(message: Message, state: FSMContext) -> bool:
@@ -415,13 +464,13 @@ async def _do_reading(
         past = _past_block(await db.last_readings(uid, 3))
 
         if drawn is None:
-            drawn = cards.draw(1 if spread == "yesno" else 3)
+            drawn = cards.draw(_spread_n(spread))
 
         # Ритуал: сначала карты ложатся на стол, разбор приходит отдельно
         await asyncio.sleep(0.8)
         header = texts.READING_HEADER_ONE if len(drawn) == 1 else texts.READING_HEADER
         await message.answer(header.format(cards=texts.cards_list_html(
-            drawn, prompts.SPREAD_POSITIONS.get(spread))).rstrip())
+            drawn, prompts.spread_labels(spread))).rstrip())
 
         try:
             reading_text = await _typing_while(
@@ -429,7 +478,9 @@ async def _do_reading(
                 llm.chat(
                     prompts.build_reading_messages(
                         name, topic_title, question, drawn, past, spread),
-                    max_tokens=400 if spread == "yesno" else 1000, temperature=0.9,
+                    max_tokens=(400 if spread == "yesno"
+                                else 1300 if spread == "week" else 1000),
+                    temperature=0.9,
                 ),
             )
         except llm.LLMError:

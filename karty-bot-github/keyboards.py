@@ -59,6 +59,7 @@ def spreads() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="⚡ Да или нет", callback_data="spread:yesno")],
         [InlineKeyboardButton(text="🔀 Выбор из двух", callback_data="spread:choice")],
         [InlineKeyboardButton(text="💔 Что он чувствует", callback_data="spread:feelings")],
+        [InlineKeyboardButton(text="🗓 Неделя вперёд", callback_data="spread:week")],
         [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")],
     ])
 
