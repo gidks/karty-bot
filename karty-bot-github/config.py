@@ -69,6 +69,20 @@ DB_PATH: str = os.getenv("DB_PATH", "tarot.db").strip()
 # Пусто — бот тянет карты сам, как раньше (Mini App выключена).
 MINIAPP_URL: str = os.getenv("MINIAPP_URL", "").strip()
 
+# --- Картинки карт для чата (карта дня и т.п.) ---
+# Публичный базовый URL, где лежат картинки карт для отправки в чат:
+# <base>/<id>.jpg (напр. cards_chat/0.jpg … 77.jpg в репозитории миниаппа).
+# Пусто — карта дня шлётся без картинки, как раньше.
+CARD_IMG_BASE: str = os.getenv(
+    "CARD_IMG_BASE", "https://gidks.github.io/karty-miniapp/cards_chat/").strip()
+
+
+def card_img_url(card_id: int) -> str:
+    """URL картинки карты для чата или '' если картинки отключены."""
+    if not CARD_IMG_BASE:
+        return ""
+    return CARD_IMG_BASE.rstrip("/") + f"/{card_id}.jpg"
+
 
 def validate() -> None:
     """Проверка обязательных настроек при старте. Понятные ошибки по-русски."""

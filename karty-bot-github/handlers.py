@@ -126,6 +126,18 @@ async def _typing_while(bot: Bot, chat_id: int, coro):
     return task.result()
 
 
+async def _send_card_photo(bot: Bot, chat_id: int, card_id: int) -> None:
+    """Шлёт картинку карты в чат. Если картинки отключены или URL не отдался —
+    молча пропускаем, текст придёт в любом случае."""
+    url = config.card_img_url(card_id)
+    if not url:
+        return
+    try:
+        await bot.send_photo(chat_id, url)
+    except Exception:  # noqa: BLE001 — картинка не критична, текст важнее
+        pass
+
+
 async def _ensure_user(message: Message) -> object | None:
     """Возвращает строку пользователя; если человека нет в базе — начинает онбординг."""
     row = await db.get_user(message.from_user.id)
@@ -673,6 +685,8 @@ async def cb_daily(call: CallbackQuery, bot: Bot) -> None:
     extra = texts.streak_line(res["streak"], res["best"])
     if res["reward"]:
         extra += texts.STREAK_REWARD.format(days=texts.days_phrase(res["streak"]))
+    # Сначала картинка карты, следом — текстовый разбор
+    await _send_card_photo(bot, call.message.chat.id, card["id"])
     body = texts.DAILY_HEADER.format(card=card["name"]) + esc(text) + extra
     if opted:
         await call.message.answer(body, reply_markup=kb.daily_toggle(True))

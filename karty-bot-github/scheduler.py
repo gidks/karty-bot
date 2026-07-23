@@ -44,6 +44,11 @@ async def daily_card_job(bot: Bot) -> None:
 
     text = texts.DAILY_HEADER.format(card=card["name"]) + esc(body)
 
+    # Картинка карты — одна на всех. Первому шлём по URL, дальше переиспользуем
+    # file_id из ответа Telegram, чтобы не тянуть URL каждому подписчику.
+    photo_url = config.card_img_url(card["id"])
+    photo_ref = photo_url or None
+
     sent = 0
     for row in users:
         if row["last_daily_date"] == today:
@@ -54,6 +59,13 @@ async def daily_card_job(bot: Bot) -> None:
         if res["reward"]:
             extra += texts.STREAK_REWARD.format(days=texts.days_phrase(res["streak"]))
         try:
+            if photo_ref:
+                try:
+                    msg = await bot.send_photo(row["user_id"], photo_ref)
+                    if msg.photo and photo_ref == photo_url:
+                        photo_ref = msg.photo[-1].file_id  # закешировали file_id
+                except Exception:  # noqa: BLE001 — картинка не критична
+                    pass
             await bot.send_message(row["user_id"], text + extra)
             sent += 1
         except Exception:  # noqa: BLE001 — заблокировали бота и т.п.
