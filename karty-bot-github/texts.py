@@ -141,6 +141,74 @@ AFTER_READING = (
     "Или возвращайся в меню.</i>"
 )
 
+# ---------- Серийная подача: карта за картой ----------
+
+# Хвост итога, когда под полем ввода ждут подсказки-реплики
+AFTER_READING_SERIAL = (
+    "\n\n———\n💬 <i>Попало? Ответь подсказкой снизу — или напиши своими словами, "
+    "посмотрим глубже.</i>"
+)
+
+# Сообщение-приглашение, если у расклада нет отдельного итога (напр. «Да или нет»)
+SERIAL_INVITE = (
+    "💬 <i>Попало? Ответь подсказкой снизу — или напиши своими словами, "
+    "посмотрим глубже.</i>"
+)
+
+SUMMARY_MSG = "✨ <b>Итог</b>\n\n{body}"
+
+WEEK_INTRO_MSG = "🗓 <b>Твоя неделя</b>\n\n{body}"
+
+
+def card_title_html(card: dict, label: str | None = None) -> str:
+    """Заголовок карточного сообщения. Когда появится отрисованная колода,
+    этот же текст станет подписью (caption) к фото карты."""
+    rev = " · <i>перевёрнутая</i>" if card.get("rev") else ""
+    title = f"🃏 <b>{esc(card['name'])}</b>{rev}"
+    if label:
+        title += f"\n<i>{esc(label)}</i>"
+    return title
+
+
+def card_ref_html(card: dict) -> str:
+    """Свёрнутая справка «что это за карта» — из базы знаний колоды, без нейросети."""
+    return (
+        "<blockquote expandable>ℹ️ <b>Что это за карта</b>\n"
+        f"{esc(card.get('essence') or '')}\n\n"
+        f"<b>В прямом положении:</b> {esc(card.get('upright') or '')}\n\n"
+        f"<b>В перевёрнутом:</b> {esc(card.get('reversed') or '')}</blockquote>"
+    )
+
+
+def card_message_html(card: dict, label: str | None, body: str,
+                      with_ref: bool = True) -> str:
+    """Полное сообщение одной карты: заголовок + разбор + свёрнутая справка."""
+    msg = card_title_html(card, label) + "\n\n" + esc(body)
+    if with_ref:
+        msg += "\n\n" + card_ref_html(card)
+    return msg
+
+
+def week_day_html(label: str, card: dict, body: str) -> str:
+    """Один день внутри группового сообщения расклада «Неделя»."""
+    rev = " (перевёрнутая)" if card.get("rev") else ""
+    return (f"🗓 <b>{esc(label)}</b> · {esc(card['name'])}{rev}\n"
+            f"{esc(body)}")
+
+
+# ---------- «Неделя»-сериал: утренние продолжения ----------
+
+WEEK_SERIAL_MSG = (
+    "🗓 <b>{day}</b> — из твоего расклада на неделю\n"
+    "<i>{card}</i>\n\n"
+    "{body}"
+)
+
+WEEK_SERIAL_LAST = (
+    "\n\nЭто был последний день из того расклада 🖤 Как неделя прошла на самом деле — "
+    "расскажешь? А захочешь заглянуть в следующую — разложим."
+)
+
 DIALOGUE_LIMIT = (
     "Чувствую, тут уже разговор не про карты, а про жизнь — и это хороший знак 🖤\n\n"
     "Дай этому раскладу улечься. А когда появится новый вопрос — приходи, разложу.\n\n"

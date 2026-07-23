@@ -53,6 +53,18 @@ def draw_cards_webapp(spread: str) -> ReplyKeyboardMarkup:
     )
 
 
+def chips_reply(chips: list[str]) -> ReplyKeyboardMarkup:
+    """Подсказки-реплики после расклада: тап отправляет текст как сообщение
+    пользовательницы — и разговор продолжается сам."""
+    rows = [[KeyboardButton(text=c)] for c in chips[:3]]
+    return ReplyKeyboardMarkup(
+        keyboard=rows,
+        resize_keyboard=True,
+        one_time_keyboard=True,
+        input_field_placeholder="Ответь — или напиши своё…",
+    )
+
+
 def spreads() -> InlineKeyboardMarkup:
     return _kb([
         [InlineKeyboardButton(text="🔮 Три карты — классика", callback_data="spread:classic")],

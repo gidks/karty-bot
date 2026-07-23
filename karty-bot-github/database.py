@@ -59,6 +59,20 @@ CREATE TABLE IF NOT EXISTS seen_cards (
     first_seen TEXT NOT NULL,
     PRIMARY KEY (user_id, card_id)
 );
+
+-- «Неделя»-сериал: расклад недели нарезан по дням, куски уходят по утрам
+CREATE TABLE IF NOT EXISTS week_serials (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    reading_id INTEGER NOT NULL,
+    day_date TEXT NOT NULL,     -- YYYY-MM-DD по Москве
+    day_label TEXT NOT NULL,    -- «Понедельник» и т.п.
+    card_name TEXT,
+    body TEXT NOT NULL,
+    is_last INTEGER NOT NULL DEFAULT 0,
+    sent INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS idx_week_serials_due ON week_serials(sent, day_date);
 """
 
 
@@ -480,6 +494,57 @@ async def daily_optin_users() -> list[aiosqlite.Row]:
                FROM users WHERE daily_opt_in = 1"""
         )
         return list(await cur.fetchall())
+    finally:
+        await db.close()
+
+
+# ---------- «Неделя»-сериал ----------
+
+async def save_week_serial(user_id: int, reading_id: int, rows: list[dict]) -> None:
+    """Сохраняет нарезанный по дням расклад недели. Новый расклад недели
+    заменяет прежний: его неотправленные дни снимаются с рассылки."""
+    db = await _conn()
+    try:
+        await db.execute(
+            "DELETE FROM week_serials WHERE user_id = ? AND sent = 0", (user_id,))
+        for r in rows:
+            await db.execute(
+                """INSERT INTO week_serials
+                   (user_id, reading_id, day_date, day_label, card_name, body,
+                    is_last, sent)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                (user_id, reading_id, r["day_date"], r["day_label"],
+                 r.get("card_name"), r["body"], r.get("is_last", 0),
+                 r.get("sent", 0)),
+            )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def due_week_serials(today: str) -> list[aiosqlite.Row]:
+    """Неотправленные куски с датой не позже сегодняшней.
+    Куски со старой датой рассылка молча помечает отправленными (не спамим
+    задним числом, если бот был выключен)."""
+    db = await _conn()
+    try:
+        cur = await db.execute(
+            """SELECT id, user_id, day_date, day_label, card_name, body, is_last
+               FROM week_serials WHERE sent = 0 AND day_date <= ?
+               ORDER BY day_date""",
+            (today,),
+        )
+        return list(await cur.fetchall())
+    finally:
+        await db.close()
+
+
+async def mark_week_serial_sent(row_id: int) -> None:
+    db = await _conn()
+    try:
+        await db.execute(
+            "UPDATE week_serials SET sent = 1 WHERE id = ?", (row_id,))
+        await db.commit()
     finally:
         await db.close()
 

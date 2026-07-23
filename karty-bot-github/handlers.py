@@ -5,7 +5,7 @@
 import asyncio
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 from aiogram import Bot, F, Router
@@ -28,6 +28,7 @@ import keyboards as kb
 import llm
 import payments
 import prompts
+import serial
 import texts
 from texts import esc
 
@@ -419,6 +420,77 @@ async def _check_readings_available(message: Message, state: FSMContext) -> bool
     return False
 
 
+async def _deliver_serial(
+    message: Message, bot: Bot, spread: str, drawn: list[dict],
+    labels: list[str] | None, parsed: dict, reading_id: int,
+) -> None:
+    """Серийная подача: карта за картой с паузами «печатает…», затем итог.
+    Подсказки-реплики вешаются reply-клавиатурой на последнее карточное
+    сообщение (inline-кнопки итога их не перебивают — это разные клавиатуры)."""
+    chat_id = message.chat.id
+    chips_kb = kb.chips_reply(parsed["chips"]) if parsed["chips"] else None
+
+    async def pause(sec: float) -> None:
+        try:
+            await bot.send_chat_action(chat_id, "typing")
+        except Exception:  # noqa: BLE001 — индикатор не критичен
+            pass
+        await asyncio.sleep(sec)
+
+    if spread == "week":
+        if parsed["intro"]:
+            await message.answer(texts.WEEK_INTRO_MSG.format(body=esc(parsed["intro"])))
+        groups = [(0, 3), (3, 5), (5, 7)]
+        for gi, (lo, hi) in enumerate(groups):
+            await pause(1.1)
+            blocks = [
+                texts.week_day_html(
+                    labels[i] if labels and i < len(labels) else f"День {i + 1}",
+                    drawn[i], parsed["cards"][i])
+                for i in range(lo, hi)
+            ]
+            await message.answer(
+                "\n\n".join(blocks),
+                reply_markup=chips_kb if gi == len(groups) - 1 else None)
+    else:
+        n = len(parsed["cards"])
+        for i, body in enumerate(parsed["cards"]):
+            await pause(1.4 if i else 0.6)
+            label = labels[i] if labels and i < len(labels) else None
+            await message.answer(
+                texts.card_message_html(drawn[i], label, body, with_ref=True),
+                reply_markup=chips_kb if i == n - 1 else None)
+
+    await pause(1.0)
+    tail = texts.AFTER_READING_SERIAL if parsed["chips"] else texts.AFTER_READING
+    if parsed["summary"]:
+        await message.answer(
+            texts.SUMMARY_MSG.format(body=esc(parsed["summary"])) + tail,
+            reply_markup=kb.after_reading(reading_id))
+    else:
+        invite = (texts.SERIAL_INVITE if parsed["chips"]
+                  else texts.AFTER_READING.lstrip("\n"))
+        await message.answer(invite, reply_markup=kb.after_reading(reading_id))
+
+
+def _week_serial_rows(drawn: list[dict], labels: list[str] | None,
+                      parsed: dict) -> list[dict]:
+    """Кусочки недельного расклада по дням — для утренних продолжений-«сериала»."""
+    start = datetime.now(ZoneInfo(config.TIMEZONE)).date()
+    rows = []
+    for i in range(7):
+        card = drawn[i]
+        rows.append({
+            "day_date": (start + timedelta(days=i)).strftime("%Y-%m-%d"),
+            "day_label": labels[i] if labels and i < len(labels) else f"День {i + 1}",
+            "card_name": card["name"] + (" (перевёрнутая)" if card["rev"] else ""),
+            "body": parsed["cards"][i],
+            "sent": 1 if i == 0 else 0,  # сегодняшний день уже прочитан в раскладе
+            "is_last": 1 if i == 6 else 0,
+        })
+    return rows
+
+
 async def _do_reading(
     message: Message, state: FSMContext, bot: Bot,
     question: str, drawn: list[dict] | None,
@@ -471,8 +543,8 @@ async def _do_reading(
                 llm.chat(
                     prompts.build_reading_messages(
                         name, topic_title, question, drawn, past, spread),
-                    max_tokens=(400 if spread == "yesno"
-                                else 1300 if spread == "week" else 1000),
+                    max_tokens=(500 if spread == "yesno"
+                                else 1800 if spread == "week" else 1300),
                     temperature=0.9,
                 ),
             )
@@ -480,19 +552,33 @@ async def _do_reading(
             await message.answer(texts.ERROR_LLM, reply_markup=kb.to_menu())
             return
 
+        # Серийная подача: модель размечает блоки, бот раскрывает карту за картой.
+        # Если разметка кривая — parsed is None и работает старая подача.
+        labels = prompts.spread_labels(spread)
+        parsed = serial.parse(reading_text, _spread_n(spread))
+        clean_text = serial.plain_text(parsed, labels) if parsed else reading_text
+
         # Списываем расклад только после успешной генерации
         await db.consume_reading(uid, source)
         reading_id, total = await db.add_reading(
-            uid, topic_title, question, drawn, reading_text)
+            uid, topic_title, question, drawn, clean_text)
 
-        await message.answer(esc(reading_text) + texts.AFTER_READING,
-                             reply_markup=kb.after_reading(reading_id))
+        if parsed is None:
+            await message.answer(esc(reading_text) + texts.AFTER_READING,
+                                 reply_markup=kb.after_reading(reading_id))
+        else:
+            await _deliver_serial(
+                message, bot, spread, drawn, labels, parsed, reading_id)
+            if spread == "week" and len(parsed["cards"]) == 7:
+                # «Неделя»-сериал: остальные дни придут по утрам
+                await db.save_week_serial(
+                    uid, reading_id, _week_serial_rows(drawn, labels, parsed))
 
         await state.set_state(Reading.in_dialogue)
         await state.update_data(
             topic=topic_title, question=question,
             drawn=[{"id": c["id"], "name": c["name"], "rev": c["rev"]} for c in drawn],
-            reading_text=reading_text, history=[], rounds=0,
+            reading_text=clean_text, history=[], rounds=0,
         )
 
         # Реферальный бонус — после первого расклада приглашённой

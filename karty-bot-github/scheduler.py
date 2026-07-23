@@ -62,6 +62,38 @@ async def daily_card_job(bot: Bot) -> None:
     log.info("daily card sent to %s users", sent)
 
 
+async def week_serial_job(bot: Bot) -> None:
+    """«Неделя»-сериал: каждое утро — кусочек её же недельного расклада.
+    Текст уже сгенерирован в момент расклада, нейросеть не тратится."""
+    today = _today_msk()
+    rows = await db.due_week_serials(today)
+    sent = 0
+    for r in rows:
+        if r["day_date"] != today:
+            # Пропущенные дни (бот был выключен и т.п.) — не шлём задним числом
+            await db.mark_week_serial_sent(r["id"])
+            continue
+        text = texts.WEEK_SERIAL_MSG.format(
+            day=esc(r["day_label"]), card=esc(r["card_name"] or ""),
+            body=esc(r["body"]),
+        )
+        if r["is_last"]:
+            text += texts.WEEK_SERIAL_LAST
+        try:
+            await bot.send_message(
+                r["user_id"], text,
+                reply_markup=kb.to_reading() if r["is_last"] else None,
+            )
+            sent += 1
+        except Exception:  # noqa: BLE001 — заблокировали бота и т.п.
+            pass
+        finally:
+            await db.mark_week_serial_sent(r["id"])
+        await asyncio.sleep(0.05)
+    if sent:
+        log.info("week serial sent to %s users", sent)
+
+
 async def followup_job(bot: Bot) -> None:
     """Через FOLLOWUP_DAYS дней после последнего расклада — тёплое «как всё сложилось?»."""
     rows = await db.due_followups(config.FOLLOWUP_DAYS)
@@ -119,6 +151,9 @@ def setup(bot: Bot) -> AsyncIOScheduler:
     scheduler = AsyncIOScheduler(timezone=ZoneInfo(config.TIMEZONE))
     scheduler.add_job(daily_card_job, "cron", hour=config.DAILY_HOUR, minute=0,
                       args=[bot], id="daily_card")
+    # «Неделя»-сериал — следом за картой дня, чтобы утро складывалось в ритуал
+    scheduler.add_job(week_serial_job, "cron", hour=config.DAILY_HOUR, minute=2,
+                      args=[bot], id="week_serial")
     scheduler.add_job(followup_job, "interval", hours=1, args=[bot], id="followups")
     if config.NUDGE_DAYS > 0:
         # Днём, чтобы не будить: 12:00 по Москве
