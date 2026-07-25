@@ -68,6 +68,8 @@ async def _ack(call: CallbackQuery, text: str | None = None) -> None:
 
 
 def _display_name(row) -> str:
+    if row is None:
+        return "дорогая"
     return row["display_name"] or row["first_name"] or "дорогая"
 
 
@@ -89,6 +91,18 @@ def _today_msk() -> str:
 
 async def _show_menu(message: Message, text: str | None = None) -> None:
     await message.answer(text or texts.MENU_TITLE, reply_markup=kb.main_menu())
+
+
+def _paywall_text(row) -> str:
+    """Пейволл: обещание недельного пополнения, цены и витрина подписки."""
+    return texts.PAYWALL.format(
+        name=esc(_display_name(row)),
+        topup=texts.topup_promise(),
+        p_single=config.PRICE_SINGLE_RUB,
+        p_week=config.PRICE_WEEK_RUB,
+        p_month=config.PRICE_MONTH_RUB,
+        benefits=texts.sub_benefits(),
+    )
 
 
 def _past_block(rows) -> str | None:
@@ -231,7 +245,7 @@ async def cb_menu(call: CallbackQuery, state: FSMContext) -> None:
 @router.message(Command("help"))
 async def cmd_help(message: Message) -> None:
     await message.answer(
-        texts.HELP.format(free=config.FREE_READINGS, support=texts.SUPPORT_CONTACT),
+        texts.HELP.format(free_terms=texts.free_terms(), support=texts.SUPPORT_CONTACT),
         reply_markup=kb.to_menu(),
     )
 
@@ -240,7 +254,7 @@ async def cmd_help(message: Message) -> None:
 async def cb_help(call: CallbackQuery) -> None:
     await _ack(call)
     await call.message.answer(
-        texts.HELP.format(free=config.FREE_READINGS, support=texts.SUPPORT_CONTACT),
+        texts.HELP.format(free_terms=texts.free_terms(), support=texts.SUPPORT_CONTACT),
         reply_markup=kb.to_menu(),
     )
 
@@ -273,19 +287,15 @@ async def cb_new_reading(call: CallbackQuery, state: FSMContext) -> None:
     await _ack(call)
     await state.clear()
     uid = call.from_user.id
+    row = await db.get_user(uid)
     ok, _src = await db.readings_available(uid)
     if not ok:
-        row = await db.get_user(uid)
-        await call.message.answer(
-            texts.PAYWALL.format(
-                name=esc(_display_name(row)), free=config.FREE_READINGS,
-                p_single=config.PRICE_SINGLE_RUB, p_week=config.PRICE_WEEK_RUB,
-                p_month=config.PRICE_MONTH_RUB,
-            ),
-            reply_markup=kb.plans(),
-        )
+        await call.message.answer(_paywall_text(row), reply_markup=kb.plans())
         return
-    await call.message.answer(texts.SPREAD_MENU, reply_markup=kb.spreads())
+    await call.message.answer(
+        texts.SPREAD_MENU,
+        reply_markup=kb.spreads(bool(row and db.sub_active(row))),
+    )
 
 
 @router.callback_query(F.data.startswith("spread:"))
@@ -297,6 +307,22 @@ async def cb_spread(call: CallbackQuery, state: FSMContext) -> None:
         return
     if key not in texts.SPREAD_TITLES:
         return
+
+    # Премиум-расклад: без подписки показываем, что это за расклад, и что даёт
+    # подписка — не глухое «недоступно».
+    if key in config.PREMIUM_SPREADS:
+        row = await db.get_user(call.from_user.id)
+        if not (row and db.sub_active(row)):
+            await call.message.answer(
+                texts.CELTIC_LOCKED.format(
+                    benefits=texts.sub_benefits(skip="celtic"),
+                    p_week=config.PRICE_WEEK_RUB, p_month=config.PRICE_MONTH_RUB,
+                ),
+                reply_markup=kb.sub_plans(),
+            )
+            return
+        await call.message.answer(texts.CELTIC_READY)
+
     await state.set_state(Reading.waiting_question)
     await state.update_data(spread=key, topic_key=None)
     await call.message.answer(texts.ASK_SPREAD_QUESTION[key])
@@ -314,11 +340,25 @@ async def cb_topic(call: CallbackQuery, state: FSMContext) -> None:
 
 
 # Сколько карт тянется в каждом раскладе (по умолчанию 3)
-SPREAD_CARDS: dict[str, int] = {"yesno": 1, "week": 7}
+SPREAD_CARDS: dict[str, int] = {"yesno": 1, "week": 7, "celtic": 10}
+
+# Расклады, которые Mini App пока не умеет (в колоде приложения слотов до 7):
+# для них карты тянет бот сам, чтобы не было расхождения «выбрала одно —
+# пришло другое».
+NO_APP_SPREADS: set[str] = {"celtic"}
+
+# Потолок длины ответа модели по типу расклада
+SPREAD_MAX_TOKENS: dict[str, int] = {
+    "yesno": 500, "week": 1800, "celtic": 2600,
+}
 
 
 def _spread_n(spread: str) -> int:
     return SPREAD_CARDS.get(spread, 3)
+
+
+def _max_tokens(spread: str) -> int:
+    return SPREAD_MAX_TOKENS.get(spread, 1300)
 
 
 def _parse_webapp_payload(raw: str, spread: str) -> tuple[list[dict], str, str | None] | None:
@@ -361,8 +401,8 @@ async def reading_question(message: Message, state: FSMContext, bot: Bot) -> Non
         return
 
     data = await state.get_data()
-    if config.MINIAPP_URL and not data.get("no_app"):
-        spread = data.get("spread", "classic")
+    spread = data.get("spread", "classic")
+    if config.MINIAPP_URL and not data.get("no_app") and spread not in NO_APP_SPREADS:
         await state.set_state(Reading.waiting_cards)
         await state.update_data(question=question)
         await message.answer(texts.DRAW_MINIAPP, reply_markup=kb.draw_cards_webapp(spread))
@@ -421,14 +461,7 @@ async def _check_readings_available(message: Message, state: FSMContext) -> bool
         return True
     await state.clear()
     row = await db.get_user(message.from_user.id)
-    await message.answer(
-        texts.PAYWALL.format(
-            name=esc(_display_name(row)), free=config.FREE_READINGS,
-            p_single=config.PRICE_SINGLE_RUB, p_week=config.PRICE_WEEK_RUB,
-            p_month=config.PRICE_MONTH_RUB,
-        ),
-        reply_markup=kb.plans(),
-    )
+    await message.answer(_paywall_text(row), reply_markup=kb.plans())
     return False
 
 
@@ -466,8 +499,10 @@ async def _deliver_serial(
                 reply_markup=chips_kb if gi == len(groups) - 1 else None)
     else:
         n = len(parsed["cards"])
+        # Много карт (Кельтский крест) — темп бодрее, иначе разбор растянется
+        step = 0.9 if n >= 8 else 1.4
         for i, body in enumerate(parsed["cards"]):
-            await pause(1.4 if i else 0.6)
+            await pause(step if i else 0.6)
             label = labels[i] if labels and i < len(labels) else None
             await message.answer(
                 texts.card_message_html(drawn[i], label, body, with_ref=True),
@@ -555,8 +590,7 @@ async def _do_reading(
                 llm.chat(
                     prompts.build_reading_messages(
                         name, topic_title, question, drawn, past, spread),
-                    max_tokens=(500 if spread == "yesno"
-                                else 1800 if spread == "week" else 1300),
+                    max_tokens=_max_tokens(spread),
                     temperature=0.9,
                 ),
             )
@@ -576,7 +610,13 @@ async def _do_reading(
             uid, topic_title, question, drawn, clean_text)
 
         if parsed is None:
-            await message.answer(esc(reading_text) + texts.AFTER_READING,
+            # Фолбэк: модель не разметила ответ блоками. У больших раскладов
+            # полотно не влезает в одно сообщение — режем по абзацам.
+            chunks = texts.split_body(esc(reading_text))
+            for part in chunks[:-1]:
+                await message.answer(part)
+                await asyncio.sleep(0.4)
+            await message.answer(chunks[-1] + texts.AFTER_READING,
                                  reply_markup=kb.after_reading(reading_id))
         else:
             await _deliver_serial(
@@ -617,11 +657,35 @@ async def dialogue(message: Message, state: FSMContext, bot: Bot) -> None:
     data = await state.get_data()
     row = await db.get_user(uid)
     rounds = data.get("rounds", 0) + 1
-    # Лимит реплик — только без активной подписки; подписчицы говорят без лимита
-    if rounds > config.DIALOGUE_MAX and not (row and db.sub_active(row)):
-        await state.clear()
-        await message.answer(texts.DIALOGUE_LIMIT, reply_markup=kb.after_reading())
-        return
+    is_sub = bool(row and db.sub_active(row))
+
+    if not is_sub:
+        # Без подписки — лимит реплик на один расклад
+        if rounds > config.DIALOGUE_MAX:
+            await state.clear()
+            await message.answer(
+                texts.DIALOGUE_LIMIT.format(
+                    sub=config.DIALOGUE_MAX_SUB, free=config.DIALOGUE_MAX),
+                reply_markup=kb.after_reading(),
+            )
+            return
+    elif config.DIALOGUE_MAX_SUB > 0 or config.DIALOGUE_MAX_SUB_MONTH > 0:
+        # У подписчиц разговор длинный, но не бесконечный: потолок в сутки
+        # (чтобы вечер был долгим) и бюджет на месяц (чтобы 30 таких вечеров
+        # не съели выручку). Считаем в базе, а не в состоянии — иначе счётчик
+        # обнулялся бы каждым новым раскладом. Списываем ПОСЛЕ ответа модели.
+        status, used = await db.sub_dialogue_check(
+            uid, _today_msk(), config.DIALOGUE_MAX_SUB,
+            config.DIALOGUE_MAX_SUB_MONTH,
+        )
+        if status != "ok":
+            await state.clear()
+            await message.answer(
+                texts.DIALOGUE_LIMIT_SUB.format(n=used) if status == "day"
+                else texts.DIALOGUE_LIMIT_SUB_MONTH.format(n=used),
+                reply_markup=kb.after_reading(),
+            )
+            return
 
     history = data.get("history", [])
     history.append({"role": "user", "content": message.text.strip()[:1000]})
@@ -650,6 +714,11 @@ async def dialogue(message: Message, state: FSMContext, bot: Bot) -> None:
             await message.answer(texts.ERROR_LLM, reply_markup=kb.after_reading())
             return
 
+        # Реплику списываем только после успешного ответа
+        if is_sub and (config.DIALOGUE_MAX_SUB > 0
+                       or config.DIALOGUE_MAX_SUB_MONTH > 0):
+            await db.sub_dialogue_add(uid, _today_msk())
+
         history.append({"role": "assistant", "content": reply})
         await state.update_data(history=history[-10:], rounds=rounds)
         await message.answer(esc(reply), reply_markup=kb.after_reading())
@@ -675,11 +744,30 @@ async def cb_daily(call: CallbackQuery, bot: Bot) -> None:
 
     card = cards.daily_card(today)
     await bot.send_chat_action(call.message.chat.id, "typing")
-    try:
-        text = await llm.chat(prompts.build_daily_messages(card), max_tokens=350,
-                              temperature=0.9)
-    except llm.LLMError:
-        text = card["essence"]
+
+    # Подписчицам — личная карта дня: та же карта, но просеянная через её тему
+    header = texts.DAILY_HEADER
+    text = None
+    if config.DAILY_PERSONAL and db.sub_active(row):
+        try:
+            last = await db.last_readings(uid, 1)
+            if last:  # персонализировать нечем, если раскладов ещё не было
+                text = await llm.chat(
+                    prompts.build_daily_personal_messages(
+                        card, _display_name(row),
+                        last[0]["topic"], last[0]["question"]),
+                    max_tokens=400, temperature=0.9,
+                )
+                header = texts.DAILY_HEADER_PERSONAL
+        except Exception as e:  # noqa: BLE001 — общий текст всегда лучше ошибки
+            log.warning("личная карта дня не собралась для %s: %s", uid, e)
+            text, header = None, texts.DAILY_HEADER
+    if not text:
+        try:
+            text = await llm.chat(prompts.build_daily_messages(card), max_tokens=350,
+                                  temperature=0.9)
+        except llm.LLMError:
+            text = card["essence"]
 
     res = await db.record_daily(uid, today, card["id"], config.STREAK_REWARD_DAYS)
     extra = texts.streak_line(res["streak"], res["best"])
@@ -687,7 +775,7 @@ async def cb_daily(call: CallbackQuery, bot: Bot) -> None:
         extra += texts.STREAK_REWARD.format(days=texts.days_phrase(res["streak"]))
     # Сначала картинка карты, следом — текстовый разбор
     await _send_card_photo(bot, call.message.chat.id, card["id"])
-    body = texts.DAILY_HEADER.format(card=card["name"]) + esc(text) + extra
+    body = header.format(card=card["name"]) + esc(text) + extra
     if opted:
         await call.message.answer(body, reply_markup=kb.daily_toggle(True))
     else:
@@ -832,6 +920,99 @@ async def cb_my_readings(call: CallbackQuery) -> None:
     await call.message.answer(body, reply_markup=kb.to_reading())
 
 
+# ---------- Разбор месяца (по подписке) ----------
+
+def _review_block(rows) -> str:
+    """Прошлые расклады в компактный список для промпта разбора."""
+    items = []
+    for r in rows:
+        try:
+            names = ", ".join(
+                c["name"] + (" (перевёрнутая)" if c.get("rev") else "")
+                for c in json.loads(r["cards"] or "[]")
+            )
+        except (ValueError, TypeError, KeyError):
+            names = ""
+        mark = " [попало]" if r["rating"] == 1 else (
+            " [мимо]" if r["rating"] == -1 else "")
+        q = (r["question"] or "").strip()[:200]
+        items.append(
+            f"— {(r['created_at'] or '')[:10]}, тема «{r['topic'] or '—'}», "
+            f"вопрос: «{q}». Карты: {names}.{mark}"
+        )
+    return "\n".join(items)
+
+
+@router.callback_query(F.data == "review")
+async def cb_review(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    await _ack(call)
+    # Разбор — выход из расклада: иначе следующая её реплика уедет в диалог
+    # по старому раскладу, как будто разбора не было
+    await state.clear()
+    uid = call.from_user.id
+    row = await db.get_user(uid)
+    if row is None:
+        return
+
+    if not db.sub_active(row):
+        await call.message.answer(
+            texts.REVIEW_LOCKED.format(
+                benefits=texts.sub_benefits(skip="review"),
+                p_week=config.PRICE_WEEK_RUB, p_month=config.PRICE_MONTH_RUB,
+            ),
+            reply_markup=kb.sub_plans(back="menu"),
+        )
+        return
+
+    days = db.review_days_left(row, config.REVIEW_COOLDOWN_DAYS)
+    if days:
+        await call.message.answer(
+            texts.REVIEW_COOLDOWN.format(days=texts.days_phrase(days)),
+            reply_markup=kb.to_reading(),
+        )
+        return
+
+    rows = await db.review_readings(uid, config.REVIEW_MAX_READINGS)
+    if len(rows) < config.REVIEW_MIN_READINGS:
+        await call.message.answer(
+            texts.REVIEW_NOT_ENOUGH.format(
+                n=config.REVIEW_MIN_READINGS,
+                have=texts.readings_phrase(len(rows)),
+            ),
+            reply_markup=kb.to_reading(),
+        )
+        return
+
+    if uid in BUSY:
+        await call.message.answer(texts.BUSY)
+        return
+
+    BUSY.add(uid)
+    try:
+        await call.message.answer(texts.REVIEW_WAIT)
+        try:
+            body = await _typing_while(
+                bot, call.message.chat.id,
+                llm.chat(
+                    prompts.build_review_messages(
+                        _display_name(row), _review_block(rows)),
+                    max_tokens=900, temperature=0.85,
+                ),
+            )
+        except llm.LLMError:
+            await call.message.answer(texts.ERROR_LLM, reply_markup=kb.to_menu())
+            return
+        # Отмечаем только после успешной генерации — иначе съели бы месяц зря
+        await db.set_review_done(uid)
+        await call.message.answer(
+            texts.REVIEW_HEADER.format(n=texts.readings_phrase(len(rows)))
+            + esc(body) + texts.REVIEW_FOOTER,
+            reply_markup=kb.to_reading(),
+        )
+    finally:
+        BUSY.discard(uid)
+
+
 # ---------- Реферальная ссылка ----------
 
 @router.callback_query(F.data == "share")
@@ -859,6 +1040,7 @@ async def cb_tariffs(call: CallbackQuery) -> None:
         texts.TARIFFS.format(
             p_single=config.PRICE_SINGLE_RUB, p_week=config.PRICE_WEEK_RUB,
             p_month=config.PRICE_MONTH_RUB, left=left,
+            benefits=texts.sub_benefits(), free_note=texts.free_note(),
         ),
         reply_markup=kb.plans(),
     )

@@ -26,9 +26,65 @@ def _today_msk() -> str:
     return datetime.now(ZoneInfo(config.TIMEZONE)).strftime("%Y-%m-%d")
 
 
+async def personal_daily_text(user_id: int, name: str, card: dict) -> str | None:
+    """Личная карта дня для подписчицы: та же карта, но просеянная через её
+    последний расклад.
+
+    Возвращает:
+      текст — получилось;
+      ""    — персонализировать нечем (раскладов ещё не было), это НЕ сбой;
+      None  — сбой (провайдер, база): шлём общий текст.
+    Разница важна: на None срабатывает предохранитель, а «нечем» не должно
+    выключать персонализацию всем остальным."""
+    try:
+        rows = await db.last_readings(user_id, 1)
+        if not rows:
+            return ""  # запрос к модели не делаем вообще
+        last = rows[0]
+        body = await llm.chat(
+            prompts.build_daily_personal_messages(
+                card, name, last["topic"], last["question"]),
+            max_tokens=400, temperature=0.9,
+        )
+    except Exception as e:  # noqa: BLE001 — личная карта не должна ронять рассылку
+        # Сюда попадает и «database is locked», и любой сбой провайдера:
+        # подписчица получит общий текст, остальные — свою карту как обычно.
+        log.warning("personal daily failed for %s: %s", user_id, e)
+        return None
+    if not (body or "").strip():
+        return None
+    return texts.DAILY_HEADER_PERSONAL.format(card=card["name"]) + esc(body)
+
+
+async def weekly_topup_job(bot: Bot) -> None:
+    """Недельное пополнение бесплатных раскладов. Сначала запоминаем, у кого
+    было пусто (им и скажем), потом начисляем."""
+    if config.FREE_WEEKLY_TOPUP <= 0 or config.FREE_TOPUP_CAP <= 0:
+        return
+    targets = (await db.topup_notify_targets(config.TOPUP_NOTIFY_DAYS)
+               if config.TOPUP_NOTIFY_DAYS > 0 else [])
+    n = await db.weekly_topup(config.FREE_WEEKLY_TOPUP, config.FREE_TOPUP_CAP)
+    log.info("weekly topup: пополнено %s, напоминаем %s", n, len(targets))
+
+    for r in targets:
+        try:
+            await bot.send_message(
+                r["user_id"],
+                texts.TOPUP_GRANTED.format(
+                    name=esc(r["name"]), weekday=texts.topup_weekday()),
+                reply_markup=kb.to_reading(),
+            )
+        except Exception:  # noqa: BLE001 — заблокировали бота и т.п.
+            pass
+        # Гасим «напоминание о неиспользованных бесплатных»: иначе через час
+        # nudge_job напишет тому же человеку почти то же самое второй раз
+        await db.mark_nudge_sent(r["user_id"])
+        await asyncio.sleep(0.05)
+
+
 async def daily_card_job(bot: Bot) -> None:
-    """Утренняя карта дня всем подписанным. Карта и текст — одни на всех,
-    генерируем один раз за утро."""
+    """Утренняя карта дня всем подписанным. Карта — одна на всех, общий текст
+    генерируется один раз за утро. Подписчицам — личный текст по их теме."""
     today = _today_msk()
     users = await db.daily_optin_users()
     if not users:
@@ -50,9 +106,33 @@ async def daily_card_job(bot: Bot) -> None:
     photo_ref = photo_url or None
 
     sent = 0
+    tried = done = fails = 0
     for row in users:
         if row["last_daily_date"] == today:
             continue  # уже вытянула сама сегодня
+
+        # Личный текст — только активным подписчицам. Предохранители считают
+        # ПОПЫТКИ, а не удачи: если провайдер лежит, мы не должны молотить
+        # запросы по всей базе и задерживать рассылку остальным.
+        body_text = text
+        if (config.DAILY_PERSONAL and db.sub_active(row)
+                and tried < config.DAILY_PERSONAL_LIMIT and fails < 3):
+            personal = await personal_daily_text(
+                row["user_id"],
+                row["display_name"] or row["first_name"] or "дорогая",
+                card,
+            )
+            if personal == "":
+                pass          # нечего персонализировать — ни попытка, ни сбой
+            elif personal:
+                tried += 1
+                done += 1
+                fails = 0
+                body_text = personal
+            else:
+                tried += 1
+                fails += 1    # реальный сбой: три подряд — выключаем на утро
+
         res = await db.record_daily(row["user_id"], today, card["id"],
                                     config.STREAK_REWARD_DAYS)
         extra = texts.streak_line(res["streak"], res["best"])
@@ -66,12 +146,15 @@ async def daily_card_job(bot: Bot) -> None:
                         photo_ref = msg.photo[-1].file_id  # закешировали file_id
                 except Exception:  # noqa: BLE001 — картинка не критична
                     pass
-            await bot.send_message(row["user_id"], text + extra)
+            await bot.send_message(row["user_id"], body_text + extra)
             sent += 1
         except Exception:  # noqa: BLE001 — заблокировали бота и т.п.
             pass
         await asyncio.sleep(0.05)
-    log.info("daily card sent to %s users", sent)
+    if fails >= 3:
+        log.warning("персональные карты дня отключены на это утро: 3 сбоя подряд")
+    log.info("daily card sent to %s users (личных: %s из %s попыток)",
+             sent, done, tried)
 
 
 async def week_serial_job(bot: Bot) -> None:
@@ -167,6 +250,13 @@ def setup(bot: Bot) -> AsyncIOScheduler:
     scheduler.add_job(week_serial_job, "cron", hour=config.DAILY_HOUR, minute=2,
                       args=[bot], id="week_serial")
     scheduler.add_job(followup_job, "interval", hours=1, args=[bot], id="followups")
+    if config.FREE_WEEKLY_TOPUP > 0 and config.FREE_TOPUP_CAP > 0:
+        # Недельное пополнение бесплатных раскладов — раз в неделю, днём
+        scheduler.add_job(
+            weekly_topup_job, "cron",
+            day_of_week=config.TOPUP_WEEKDAY, hour=config.TOPUP_HOUR, minute=0,
+            args=[bot], id="weekly_topup",
+        )
     if config.NUDGE_DAYS > 0:
         # Днём, чтобы не будить: 12:00 по Москве
         scheduler.add_job(nudge_job, "cron", hour=12, minute=0, args=[bot], id="nudges")

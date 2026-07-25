@@ -25,7 +25,12 @@ CREATE TABLE IF NOT EXISTS users (
     last_daily_date TEXT,
     referrer_id INTEGER,
     referral_bonus_given INTEGER NOT NULL DEFAULT 0,
-    nudge_sent INTEGER NOT NULL DEFAULT 0
+    nudge_sent INTEGER NOT NULL DEFAULT 0,
+    sub_dialogue_date TEXT,
+    sub_dialogue_count INTEGER NOT NULL DEFAULT 0,
+    sub_dialogue_month TEXT,
+    sub_dialogue_month_count INTEGER NOT NULL DEFAULT 0,
+    last_review TEXT
 );
 
 CREATE TABLE IF NOT EXISTS readings (
@@ -106,6 +111,14 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     await ensure("users", "nudge_sent", "nudge_sent INTEGER NOT NULL DEFAULT 0")
     await ensure("users", "daily_streak", "daily_streak INTEGER NOT NULL DEFAULT 0")
     await ensure("users", "best_streak", "best_streak INTEGER NOT NULL DEFAULT 0")
+    # Суточный счётчик реплик у подписчиц и дата последнего «разбора месяца»
+    await ensure("users", "sub_dialogue_date", "sub_dialogue_date TEXT")
+    await ensure("users", "sub_dialogue_count",
+                 "sub_dialogue_count INTEGER NOT NULL DEFAULT 0")
+    await ensure("users", "sub_dialogue_month", "sub_dialogue_month TEXT")
+    await ensure("users", "sub_dialogue_month_count",
+                 "sub_dialogue_month_count INTEGER NOT NULL DEFAULT 0")
+    await ensure("users", "last_review", "last_review TEXT")
 
     # Бэкфилл коллекции из уже сделанных раскладов (один раз, безопасно повторять)
     cur = await db.execute("SELECT COUNT(*) FROM seen_cards")
@@ -241,6 +254,153 @@ async def add_free_readings(user_id: int, n: int = 1) -> None:
         await db.commit()
     finally:
         await db.close()
+
+
+async def topup_notify_targets(days: int) -> list[aiosqlite.Row]:
+    """Кому сказать про недельное пополнение: прошли онбординг, свободных
+    раскладов не осталось, подписки нет, заходила не позже N дней назад.
+    Вызывать ДО weekly_topup — иначе баланс уже не нулевой."""
+    cutoff = (now_utc() - timedelta(days=days)).isoformat()
+    db = await _conn()
+    try:
+        cur = await db.execute(
+            """SELECT user_id, COALESCE(display_name, first_name, 'привет') AS name
+               FROM users
+               WHERE display_name IS NOT NULL
+                 AND free_readings_left <= 0
+                 AND paid_readings_left <= 0
+                 AND (subscription_until IS NULL OR subscription_until <= ?)
+                 AND last_seen >= ?""",
+            (now_iso(), cutoff),
+        )
+        return list(await cur.fetchall())
+    finally:
+        await db.close()
+
+
+async def weekly_topup(amount: int, cap: int) -> int:
+    """Недельное пополнение бесплатных раскладов. Начисляем только тем, у кого
+    меньше потолка и нет активной подписки — накопленное сверх потолка
+    (рефералка, серия карты дня) не отбираем. Возвращает число пополненных."""
+    if amount <= 0 or cap <= 0:
+        return 0
+    db = await _conn()
+    try:
+        cur = await db.execute(
+            """UPDATE users
+                  SET free_readings_left = MIN(free_readings_left + ?, ?)
+                WHERE display_name IS NOT NULL
+                  AND free_readings_left < ?
+                  AND (subscription_until IS NULL OR subscription_until <= ?)""",
+            (amount, cap, cap, now_iso()),
+        )
+        await db.commit()
+        return cur.rowcount
+    finally:
+        await db.close()
+
+
+# ---------- Разговор после расклада: суточный лимит у подписчиц ----------
+
+async def sub_dialogue_check(
+    user_id: int, date_str: str, limit_day: int, limit_month: int = 0,
+) -> tuple[str, int]:
+    """Проверка лимитов реплик подписчицы — БЕЗ списания (дата «YYYY-MM-DD»
+    по Москве приходит снаружи). Списывает потом sub_dialogue_add, уже после
+    успешного ответа модели: сорванная генерация не должна съедать бюджет.
+
+    Возвращает (статус, использовано):
+      "ok"    — можно отвечать;
+      "day"   — исчерпан суточный потолок (использовано = за сутки);
+      "month" — исчерпан месячный бюджет (использовано = за месяц)."""
+    used_day, used_month = await sub_dialogue_used(user_id, date_str)
+    if limit_month > 0 and used_month >= limit_month:
+        return "month", used_month
+    if limit_day > 0 and used_day >= limit_day:
+        return "day", used_day
+    return "ok", used_day
+
+
+async def sub_dialogue_used(user_id: int, date_str: str) -> tuple[int, int]:
+    """Сколько реплик израсходовано за сутки и за календарный месяц.
+    Счётчики обнуляются сами при смене даты и месяца."""
+    month_str = date_str[:7]
+    db = await _conn()
+    try:
+        row = await (await db.execute(
+            """SELECT sub_dialogue_date, sub_dialogue_count,
+                      sub_dialogue_month, sub_dialogue_month_count
+               FROM users WHERE user_id = ?""",
+            (user_id,),
+        )).fetchone()
+        if row is None:
+            return 0, 0
+        used_day = (row["sub_dialogue_count"] or 0)
+        if row["sub_dialogue_date"] != date_str:
+            used_day = 0
+        used_month = (row["sub_dialogue_month_count"] or 0)
+        if row["sub_dialogue_month"] != month_str:
+            used_month = 0
+        return used_day, used_month
+    finally:
+        await db.close()
+
+
+async def sub_dialogue_add(user_id: int, date_str: str) -> tuple[int, int]:
+    """Списывает одну реплику из суточного и месячного счётчиков.
+    Возвращает новые значения (за сутки, за месяц)."""
+    month_str = date_str[:7]
+    used_day, used_month = await sub_dialogue_used(user_id, date_str)
+    db = await _conn()
+    try:
+        await db.execute(
+            """UPDATE users SET sub_dialogue_date = ?, sub_dialogue_count = ?,
+                                sub_dialogue_month = ?, sub_dialogue_month_count = ?
+               WHERE user_id = ?""",
+            (date_str, used_day + 1, month_str, used_month + 1, user_id),
+        )
+        await db.commit()
+        return used_day + 1, used_month + 1
+    finally:
+        await db.close()
+
+
+# ---------- «Разбор месяца» (по подписке) ----------
+
+async def review_readings(user_id: int, n: int) -> list[aiosqlite.Row]:
+    """Последние расклады для «разбора месяца» — от старых к новым."""
+    db = await _conn()
+    try:
+        cur = await db.execute(
+            """SELECT topic, question, cards, created_at, rating FROM readings
+               WHERE user_id = ? ORDER BY id DESC LIMIT ?""",
+            (user_id, n),
+        )
+        return list(reversed(await cur.fetchall()))
+    finally:
+        await db.close()
+
+
+async def set_review_done(user_id: int) -> None:
+    db = await _conn()
+    try:
+        await db.execute(
+            "UPDATE users SET last_review = ? WHERE user_id = ?", (now_iso(), user_id))
+        await db.commit()
+    finally:
+        await db.close()
+
+
+def review_days_left(row: aiosqlite.Row, cooldown_days: int) -> int:
+    """Сколько дней осталось до следующего разбора. 0 — можно прямо сейчас."""
+    last = row["last_review"] if "last_review" in row.keys() else None
+    if not last:
+        return 0
+    try:
+        passed = (now_utc() - datetime.fromisoformat(last)).days
+    except ValueError:
+        return 0
+    return max(0, cooldown_days - passed)
 
 
 async def apply_purchase(user_id: int, plan_key: str) -> None:
@@ -490,8 +650,10 @@ async def daily_optin_users() -> list[aiosqlite.Row]:
     db = await _conn()
     try:
         cur = await db.execute(
-            """SELECT user_id, display_name, first_name, last_daily_date
-               FROM users WHERE daily_opt_in = 1"""
+            """SELECT user_id, display_name, first_name, last_daily_date,
+                      subscription_until
+               FROM users WHERE daily_opt_in = 1
+               ORDER BY (subscription_until IS NOT NULL) DESC"""
         )
         return list(await cur.fetchall())
     finally:
