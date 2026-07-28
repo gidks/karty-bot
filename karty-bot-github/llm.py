@@ -28,6 +28,24 @@ def _get_client() -> AsyncOpenAI:
     return _client
 
 
+def _log_usage(resp) -> None:
+    """Пишет в лог расход токенов и попадания в кэш промпта.
+
+    cached=0 при живом трафике значит, что кэш не сработал: либо провайдер
+    не принял cache_control, либо префикс короче 1024 токенов, либо между
+    запросами прошло больше 5 минут (TTL) — тогда это холодный старт."""
+    try:
+        usage = resp.usage.model_dump() if resp.usage else {}
+        details = usage.get("prompt_tokens_details") or {}
+        log.info(
+            "LLM usage: in=%s out=%s cached=%s cache_write=%s",
+            usage.get("prompt_tokens"), usage.get("completion_tokens"),
+            details.get("cached_tokens", 0), details.get("cache_write_tokens", 0),
+        )
+    except Exception as e:  # noqa: BLE001 — логирование не должно ронять расклад
+        log.debug("usage log failed: %s", e)
+
+
 async def chat(
     messages: list[dict],
     max_tokens: int = 900,
@@ -44,6 +62,7 @@ async def chat(
                 max_tokens=max_tokens,
                 temperature=temperature,
             )
+            _log_usage(resp)
             text = (resp.choices[0].message.content or "").strip()
             if text:
                 return text

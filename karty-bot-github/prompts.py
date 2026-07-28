@@ -188,6 +188,26 @@ def _cards_block(drawn: list[dict], labels: list[str] | None = None) -> str:
     return "\n".join(lines)
 
 
+def _cached_system(text: str) -> dict:
+    """Системное сообщение, помеченное для кэширования на стороне провайдера.
+
+    Текст промпта не меняется — меняется только упаковка: content становится
+    списком блоков, у последнего стоит cache_control. AITunnel передаёт это
+    в Anthropic, и повторное чтение того же префикса стоит 0.1x вместо 1x.
+
+    Кэшируется только префикс длиной от 1024 токенов (порог Sonnet 4.6);
+    промпты короче провайдер просто отдаёт по обычной цене, без штрафа.
+    TTL кэш-записи — 5 минут. Провайдеры, не понимающие cache_control,
+    игнорируют поле: формат блоков — валидный OpenAI-совместимый content."""
+    return {
+        "role": "system",
+        "content": [
+            {"type": "text", "text": text,
+             "cache_control": {"type": "ephemeral"}},
+        ],
+    }
+
+
 def build_reading_messages(
     name: str, topic: str, question: str, drawn: list[dict],
     past_block: str | None = None, spread: str = "classic",
@@ -208,7 +228,9 @@ def build_reading_messages(
     if past_block:
         user += f"Прошлые расклады этого человека:\n{past_block}\n\n"
     user += "Сделай расклад по правилам."
-    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+    # Системный блок (персона + правила спреда) одинаков у всех раскладов
+    # этого типа — он и есть кэшируемый префикс.
+    return [_cached_system(system), {"role": "user", "content": user}]
 
 
 def build_dialogue_messages(
@@ -229,7 +251,10 @@ def build_dialogue_messages(
         f"Текст расклада, который ты уже дала:\n{reading_text[:1500]}"
     )
     system = PERSONA + "\n\n" + DIALOGUE_RULES + "\n\n" + context
-    return [{"role": "system", "content": system}, *history]
+    # Персона + правила диалога сами по себе короче порога в 1024 токена,
+    # поэтому кэшируем их вместе с контекстом расклада: внутри одной сессии
+    # он не меняется, и со второй реплики идут попадания в кэш.
+    return [_cached_system(system), *history]
 
 
 def build_daily_messages(card: dict) -> list[dict]:
