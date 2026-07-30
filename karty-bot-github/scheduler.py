@@ -4,6 +4,7 @@
 import asyncio
 import json
 import logging
+import zlib
 from datetime import datetime
 from zoneinfo import ZoneInfo
 
@@ -24,6 +25,37 @@ log = logging.getLogger(__name__)
 
 def _today_msk() -> str:
     return datetime.now(ZoneInfo(config.TIMEZONE)).strftime("%Y-%m-%d")
+
+
+# Картинка → file_id: первый раз Telegram тянет файл по URL, дальше отправляем
+# по id, то есть бесплатно и мгновенно. Живёт в памяти процесса, после рестарта
+# наполняется заново — это нормально, потерь нет.
+_MOOD_FILE_IDS: dict[int, str] = {}
+
+
+def _mood_index(user_id: int, salt: str) -> int:
+    """Какая картинка достанется этому человеку в этот раз. crc32, а не hash():
+    у встроенного hash() соль случайная при каждом запуске, и одна и та же
+    рассылка давала бы разные картинки после рестарта."""
+    return zlib.crc32(f"{user_id}:{salt}".encode()) % max(config.MOOD_COUNT, 1)
+
+
+async def send_mood_photo(bot: Bot, chat_id: int, user_id: int, salt: str) -> None:
+    """Прикладывает к напоминалке атмосферную картинку из банка. Ротация — по
+    пользователю и поводу, чтобы одному человеку не приходило одно и то же.
+    Картинка некритична: любая ошибка не должна ронять само сообщение."""
+    if config.MOOD_COUNT <= 0 or not config.MOOD_IMG_BASE:
+        return
+    idx = _mood_index(user_id, salt)
+    ref = _MOOD_FILE_IDS.get(idx) or config.mood_img_url(idx)
+    if not ref:
+        return
+    try:
+        msg = await bot.send_photo(chat_id, ref)
+        if msg.photo and idx not in _MOOD_FILE_IDS:
+            _MOOD_FILE_IDS[idx] = msg.photo[-1].file_id
+    except Exception as e:  # noqa: BLE001 — картинка не важнее письма
+        log.warning("картинка напоминалки не ушла (%s): %s", idx, e)
 
 
 async def personal_daily_text(user_id: int, name: str, card: dict) -> str | None:
@@ -68,6 +100,7 @@ async def weekly_topup_job(bot: Bot) -> None:
 
     for r in targets:
         try:
+            await send_mood_photo(bot, r["user_id"], r["user_id"], f"topup:{_today_msk()}")
             await bot.send_message(
                 r["user_id"],
                 texts.TOPUP_GRANTED.format(
@@ -133,11 +166,17 @@ async def daily_card_job(bot: Bot) -> None:
                 tried += 1
                 fails += 1    # реальный сбой: три подряд — выключаем на утро
 
+        # Первое утро: человек карту дня не заказывал (теперь она включена по
+        # умолчанию), поэтому сразу говорим, что это регулярно, и даём выход.
+        first_morning = not row["last_daily_date"]
+
         res = await db.record_daily(row["user_id"], today, card["id"],
                                     config.STREAK_REWARD_DAYS)
         extra = texts.streak_line(res["streak"], res["best"])
         if res["reward"]:
             extra += texts.STREAK_REWARD.format(days=texts.days_phrase(res["streak"]))
+        if first_morning:
+            extra += texts.DAILY_FIRST_NOTE
         try:
             if photo_ref:
                 try:
@@ -146,7 +185,8 @@ async def daily_card_job(bot: Bot) -> None:
                         photo_ref = msg.photo[-1].file_id  # закешировали file_id
                 except Exception:  # noqa: BLE001 — картинка не критична
                     pass
-            await bot.send_message(row["user_id"], body_text + extra)
+            await bot.send_message(row["user_id"], body_text + extra,
+                                   reply_markup=kb.daily_morning())
             sent += 1
         except Exception:  # noqa: BLE001 — заблокировали бота и т.п.
             pass
@@ -190,7 +230,13 @@ async def week_serial_job(bot: Bot) -> None:
 
 
 async def followup_job(bot: Bot) -> None:
-    """Через FOLLOWUP_DAYS дней после последнего расклада — тёплое «как всё сложилось?»."""
+    """Через FOLLOWUP_DAYS дней после последнего расклада — тёплое «как всё сложилось?».
+
+    Задача крутится каждый час, поэтому письмо может выпасть на ночь. Держим его
+    в дневном окне: ночной пуш ловит блокировку надёжнее любого спама."""
+    hour = datetime.now(ZoneInfo(config.TIMEZONE)).hour
+    if not config.FOLLOWUP_HOUR_FROM <= hour < config.FOLLOWUP_HOUR_TO:
+        return
     rows = await db.due_followups(config.FOLLOWUP_DAYS)
     for r in rows:
         try:
@@ -201,6 +247,7 @@ async def followup_job(bot: Bot) -> None:
                     first_card = parsed[0]["name"]
             except (ValueError, KeyError, TypeError):
                 pass
+            await send_mood_photo(bot, r["user_id"], r["user_id"], f"followup:{r['id']}")
             await bot.send_message(
                 r["user_id"],
                 texts.FOLLOWUP.format(
@@ -223,6 +270,7 @@ async def nudge_job(bot: Bot) -> None:
     sent = 0
     for r in rows:
         try:
+            await send_mood_photo(bot, r["user_id"], r["user_id"], "nudge")
             await bot.send_message(
                 r["user_id"],
                 texts.NUDGE_FREE.format(

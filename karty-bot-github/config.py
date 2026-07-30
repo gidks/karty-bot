@@ -98,6 +98,10 @@ REVIEW_MAX_READINGS: int = _int("REVIEW_MAX_READINGS", 12)
 # +1 бесплатный расклад за каждые N дней серии карты дня (0 = выключить)
 STREAK_REWARD_DAYS: int = _int("STREAK_REWARD_DAYS", 7)
 FOLLOWUP_DAYS: int = _int("FOLLOWUP_DAYS", 3)
+# followup_job крутится каждый час — держим отправку в дневном окне по Москве,
+# чтобы «как всё сложилось?» не приходило в четыре утра.
+FOLLOWUP_HOUR_FROM: int = _int("FOLLOWUP_HOUR_FROM", 10)
+FOLLOWUP_HOUR_TO: int = _int("FOLLOWUP_HOUR_TO", 21)
 # Через сколько дней тишины напомнить о неиспользованных бесплатных раскладах (0 = выключить)
 NUDGE_DAYS: int = _int("NUDGE_DAYS", 2)
 DAILY_HOUR: int = _int("DAILY_HOUR", 9)
@@ -124,6 +128,24 @@ def card_img_url(card_id: int) -> str:
     if not CARD_IMG_BASE:
         return ""
     return CARD_IMG_BASE.rstrip("/") + f"/{card_id}.jpg"
+
+
+# --- Атмосферные картинки для напоминалок ---
+# Банк одинаковых по стилю квадратов (mood_01.jpg … mood_NN.jpg) в репозитории
+# миниаппа. Прикладываются к followup, nudge и понедельничному письму — у карты
+# дня своя картинка, туда не лезем. Пусто или MOOD_COUNT=0 — шлём без картинки.
+# Картинки залиты в корень репозитория миниаппа, а не в подпапку — поэтому
+# база без /mood. Переложишь в папку — поменяй здесь или в .env, код не трогать.
+MOOD_IMG_BASE: str = os.getenv(
+    "MOOD_IMG_BASE", "https://gidks.github.io/karty-miniapp/").strip()
+MOOD_COUNT: int = _int("MOOD_COUNT", 12)
+
+
+def mood_img_url(index: int) -> str:
+    """URL картинки напоминалки по индексу 0..MOOD_COUNT-1 или '' если выключены."""
+    if not MOOD_IMG_BASE or MOOD_COUNT <= 0:
+        return ""
+    return MOOD_IMG_BASE.rstrip("/") + f"/mood_{index % MOOD_COUNT + 1:02d}.jpg"
 
 
 def validate() -> None:

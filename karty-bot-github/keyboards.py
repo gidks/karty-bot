@@ -171,6 +171,15 @@ def daily_toggle(opted_in: bool) -> InlineKeyboardMarkup:
     ])
 
 
+def daily_morning() -> InlineKeyboardMarkup:
+    """Клавиатура утренней рассылки: приглашение разложить + отписка в один тап.
+    Карта дня теперь включена по умолчанию, поэтому выход должен быть на виду."""
+    return _kb([
+        [InlineKeyboardButton(text="🔮 Разложить карты", callback_data="new_reading")],
+        [InlineKeyboardButton(text="🔕 Отключить утренние", callback_data="daily_sub:off")],
+    ])
+
+
 def collection_menu() -> InlineKeyboardMarkup:
     return _kb([
         [InlineKeyboardButton(text="🃏 Карта дня", callback_data="daily_card")],

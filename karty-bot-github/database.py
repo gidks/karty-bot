@@ -21,7 +21,10 @@ CREATE TABLE IF NOT EXISTS users (
     paid_readings_left INTEGER NOT NULL DEFAULT 0,
     subscription_until TEXT,
     readings_count INTEGER NOT NULL DEFAULT 0,
-    daily_opt_in INTEGER NOT NULL DEFAULT 0,
+    -- Утренняя карта дня включена по умолчанию: опт-ин показывался только тем,
+    -- кто сам нажал «карта дня», и до него не доходил почти никто.
+    daily_opt_in INTEGER NOT NULL DEFAULT 1,
+    daily_default_applied INTEGER NOT NULL DEFAULT 0,
     last_daily_date TEXT,
     referrer_id INTEGER,
     referral_bonus_given INTEGER NOT NULL DEFAULT 0,
@@ -119,6 +122,27 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     await ensure("users", "sub_dialogue_month_count",
                  "sub_dialogue_month_count INTEGER NOT NULL DEFAULT 0")
     await ensure("users", "last_review", "last_review TEXT")
+    await ensure("users", "daily_default_applied",
+                 "daily_default_applied INTEGER NOT NULL DEFAULT 0")
+
+    # Разовое включение утренней карты дня тем, кто зарегистрировался до того,
+    # как она стала опцией по умолчанию. Флаг daily_default_applied ставится
+    # здесь же и при регистрации, поэтому осознанное «отключить» не отменится
+    # при следующем рестарте.
+    #
+    # ⚠️ Пишем только когда есть кого чинить, и сразу коммитим: незакрытая
+    # транзакция роняет следующий за миграцией PRAGMA journal_mode=WAL
+    # («cannot change into wal mode from within a transaction») — то есть бот
+    # просто не стартует на втором запуске.
+    cur = await db.execute("SELECT COUNT(*) FROM users WHERE daily_default_applied = 0")
+    pending = (await cur.fetchall())[0][0]
+    await cur.close()
+    if pending:
+        await db.execute(
+            """UPDATE users SET daily_opt_in = 1, daily_default_applied = 1
+               WHERE daily_default_applied = 0"""
+        )
+        await db.commit()
 
     # Бэкфилл коллекции из уже сделанных раскладов (один раз, безопасно повторять)
     cur = await db.execute("SELECT COUNT(*) FROM seen_cards")
@@ -169,8 +193,8 @@ async def create_user(
         await db.execute(
             """INSERT OR IGNORE INTO users
                (user_id, username, first_name, source, created_at, last_seen,
-                free_readings_left, referrer_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                free_readings_left, referrer_id, daily_opt_in, daily_default_applied)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 1)""",
             (user_id, username, first_name, source, now_iso(), now_iso(),
              config.FREE_READINGS, referrer_id),
         )
@@ -652,7 +676,8 @@ async def daily_optin_users() -> list[aiosqlite.Row]:
         cur = await db.execute(
             """SELECT user_id, display_name, first_name, last_daily_date,
                       subscription_until
-               FROM users WHERE daily_opt_in = 1
+               FROM users
+               WHERE daily_opt_in = 1 AND readings_count > 0
                ORDER BY (subscription_until IS NOT NULL) DESC"""
         )
         return list(await cur.fetchall())
@@ -871,20 +896,37 @@ async def stats_snapshot() -> dict:
         subs = await one(
             "SELECT COUNT(*) FROM users WHERE subscription_until > ?", (now_iso(),))
         daily = await one("SELECT COUNT(*) FROM users WHERE daily_opt_in = 1")
+        # Отписки от утренней карты: карта дня теперь включена по умолчанию,
+        # поэтому важна не доля подписанных, а доля тех, кто выключил руками.
+        daily_off = await one(
+            """SELECT COUNT(*) FROM users
+               WHERE daily_opt_in = 0 AND daily_default_applied = 1"""
+        )
         rate_up = await one("SELECT COUNT(*) FROM readings WHERE rating = 1")
         rate_down = await one("SELECT COUNT(*) FROM readings WHERE rating = -1")
 
+        # По источнику важны не старты, а поведение: шесть человек, сделавших
+        # по три расклада, и шесть отвалившихся после первого — разные шесть.
         cur = await db.execute(
-            """SELECT COALESCE(source, 'organic') AS src, COUNT(*) AS n
+            """SELECT COALESCE(source, 'organic')                   AS src,
+                      COUNT(*)                                      AS n,
+                      COALESCE(SUM(readings_count), 0)              AS reads,
+                      SUM(CASE WHEN readings_count > 0 THEN 1 ELSE 0 END)      AS active,
+                      SUM(CASE WHEN free_readings_left = 0
+                                AND readings_count > 0 THEN 1 ELSE 0 END)      AS spent
                FROM users GROUP BY src ORDER BY n DESC LIMIT 8"""
         )
-        sources = [(r["src"], r["n"]) for r in await cur.fetchall()]
+        sources = [
+            (r["src"], r["n"], r["reads"], r["active"], r["spent"])
+            for r in await cur.fetchall()
+        ]
 
         return {
             "users": int(users), "users_24h": int(users_24h), "users_7d": int(users_7d),
             "readings": int(readings), "readings_24h": int(readings_24h),
             "pay_count": int(pay_count), "rub": float(rub), "stars": int(stars),
-            "subs": int(subs), "daily": int(daily), "sources": sources,
+            "subs": int(subs), "daily": int(daily), "daily_off": int(daily_off),
+            "sources": sources,
             "rate_up": int(rate_up), "rate_down": int(rate_down),
         }
     finally:

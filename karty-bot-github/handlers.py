@@ -264,12 +264,17 @@ async def cb_help(call: CallbackQuery) -> None:
 @router.message(Command("stats"), F.from_user.id.in_(config.ADMIN_IDS))
 async def cmd_stats(message: Message) -> None:
     s = await db.stats_snapshot()
-    sources = "\n".join(f"· {esc(src)}: {n}" for src, n in s["sources"]) or "—"
+    # По источнику: старты → сколько дошло до первого расклада, раскладов всего,
+    # сколько исчерпало бесплатные (то есть упёрлось в пейволл)
+    sources = "\n".join(
+        f"· {esc(src)}: {n} → {active} с раскладом, {reads} раскладов, {spent} упёрлись"
+        for src, n, reads, active, spent in s["sources"]
+    ) or "—"
     await message.answer(texts.ADMIN_STATS.format(
         users=s["users"], users_24h=s["users_24h"], users_7d=s["users_7d"],
         readings=s["readings"], readings_24h=s["readings_24h"],
         pay_count=s["pay_count"], rub=s["rub"], stars=s["stars"],
-        subs=s["subs"], daily=s["daily"], sources=sources,
+        subs=s["subs"], daily=s["daily"], daily_off=s["daily_off"], sources=sources,
         rate_up=s["rate_up"], rate_down=s["rate_down"],
     ))
 
