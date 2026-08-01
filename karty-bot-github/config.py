@@ -92,7 +92,7 @@ PLANS: dict[str, dict] = {
         "stars": STARS_BUNDLE, "days": None, "kind": "bundle", "bundle": "month",
     },
     "month": {
-        "title": "Подписка на месяц", "rub": PRICE_MONTH_RUB,
+        "title": "«Со мной без счёта» — 30 дней", "rub": PRICE_MONTH_RUB,
         "stars": STARS_MONTH, "days": 30, "kind": "sub",
     },
 }

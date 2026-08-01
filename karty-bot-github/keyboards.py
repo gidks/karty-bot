@@ -30,7 +30,7 @@ def main_menu() -> InlineKeyboardMarkup:
         ],
         [
             InlineKeyboardButton(text="📖 Моя история", callback_data="my_readings"),
-            InlineKeyboardButton(text="🌙 Разбор месяца", callback_data="review"),
+            InlineKeyboardButton(text="🪞 Разбор месяца", callback_data="review"),
         ],
         [
             InlineKeyboardButton(text="🎁 Подарить подруге", callback_data="share"),
@@ -105,7 +105,7 @@ def sub_plans(back: str = "new_reading") -> InlineKeyboardMarkup:
     p = config.PLANS
     return _kb([
         [InlineKeyboardButton(
-            text=f"🖤 Месяц со мной — {p['month']['rub']} ₽", callback_data="buy:month")],
+            text=f"🖤 Со мной без счёта — {p['month']['rub']} ₽", callback_data="buy:month")],
         [
             InlineKeyboardButton(text="💳 Все тарифы", callback_data="tariffs"),
             InlineKeyboardButton(text="⬅️ Назад", callback_data=back),
@@ -249,7 +249,7 @@ def plans() -> InlineKeyboardMarkup:
         ]
     rows += [
         [InlineKeyboardButton(
-            text=f"🖤 Месяц со мной — {p['month']['rub']} ₽", callback_data="buy:month")],
+            text=f"🖤 Со мной без счёта — {p['month']['rub']} ₽", callback_data="buy:month")],
         [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")],
     ]
     return _kb(rows)
