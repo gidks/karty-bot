@@ -3,6 +3,7 @@
 
 import json
 from datetime import datetime, timedelta, timezone
+from zoneinfo import ZoneInfo
 
 import aiosqlite
 
@@ -45,9 +46,53 @@ CREATE TABLE IF NOT EXISTS readings (
     reading_text TEXT,
     created_at TEXT NOT NULL,
     followup_sent INTEGER NOT NULL DEFAULT 0,
-    rating INTEGER
+    rating INTEGER,
+    bundle_id INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_readings_user ON readings(user_id);
+-- ⚠️ Индекс по readings.bundle_id создаётся НЕ здесь, а в _migrate: на старой
+-- базе таблица readings уже существует (CREATE TABLE IF NOT EXISTS её не
+-- трогает), колонки bundle_id в ней ещё нет, и CREATE INDEX падает раньше,
+-- чем миграция успевает её добавить. То есть бот просто не стартует.
+
+-- Бандл: одна ситуация, доведённая до конца, с расписанием.
+-- status: 'new' — оплачен, но она ещё не начала (не ответила на вопросы входа);
+--         'active' — день 0 сделан, шаги ждут своих дат;
+--         'done' — финальное письмо отправлено.
+CREATE TABLE IF NOT EXISTS bundles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    kind TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'new',
+    intro TEXT,                 -- JSON: ответы на вопросы входа
+    marker TEXT,                -- маркер наблюдения из последнего расклада
+    day0_reading_id INTEGER,
+    created_at TEXT NOT NULL,
+    started_at TEXT,
+    finished_at TEXT,
+    reminded_at TEXT            -- когда позвали начать оплаченный, но не начатый
+);
+CREATE INDEX IF NOT EXISTS idx_bundles_user ON bundles(user_id, status);
+
+-- Шаг бандла. Живёт в трёх состояниях:
+--   asked_at IS NULL           — ещё не спрашивали;
+--   asked_at задан, done = 0   — спросили про маркер, ждём её ответа;
+--   done = 1                   — расклад шага выдан.
+-- Ждём не бесконечно: на следующий день расклад уходит и без ответа —
+-- он не должен блокироваться её молчанием, иначе это форма, а не разговор.
+CREATE TABLE IF NOT EXISTS bundle_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    bundle_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    step_no INTEGER NOT NULL,
+    due_date TEXT NOT NULL,     -- YYYY-MM-DD по Москве
+    asked_at TEXT,
+    answer TEXT,
+    done INTEGER NOT NULL DEFAULT 0,
+    reading_id INTEGER
+);
+CREATE INDEX IF NOT EXISTS idx_bundle_steps_due ON bundle_steps(done, due_date);
+CREATE INDEX IF NOT EXISTS idx_bundle_steps_user ON bundle_steps(user_id, done);
 
 CREATE TABLE IF NOT EXISTS payments (
     payment_id TEXT PRIMARY KEY,
@@ -124,6 +169,12 @@ async def _migrate(db: aiosqlite.Connection) -> None:
     await ensure("users", "last_review", "last_review TEXT")
     await ensure("users", "daily_default_applied",
                  "daily_default_applied INTEGER NOT NULL DEFAULT 0")
+    # Связь расклада с бандлом: по ней собирается история разбора и ищется
+    # повторяющаяся карта для финального письма
+    await ensure("readings", "bundle_id", "bundle_id INTEGER")
+    # Только теперь, когда колонка точно есть (см. комментарий в SCHEMA)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_readings_bundle ON readings(bundle_id)")
 
     # Разовое включение утренней карты дня тем, кто зарегистрировался до того,
     # как она стала опцией по умолчанию. Флаг daily_default_applied ставится
@@ -427,14 +478,31 @@ def review_days_left(row: aiosqlite.Row, cooldown_days: int) -> int:
     return max(0, cooldown_days - passed)
 
 
-async def apply_purchase(user_id: int, plan_key: str) -> None:
-    plan = config.PLANS[plan_key]
+async def apply_purchase(user_id: int, plan_key: str) -> int | None:
+    """Начисляет купленное. Возвращает id созданного бандла — или None.
+
+    Тариф ищем через config.plan(): в незакрытых платежах могут остаться
+    ключи, снятые с продажи (например 'week'). Человек мог получить ссылку
+    до обновления и нажать «Я оплатила» после — деньги списаны, и мы обязаны
+    отработать их по старым условиям, а не упасть с KeyError."""
+    plan = config.plan(plan_key)
+    if plan is None:
+        return None
+    kind = plan.get("kind") or ("single" if plan["days"] is None else "sub")
+
+    # Бандл — не баланс, а запущенный сценарий: создаём его и отдаём id,
+    # чтобы бот тут же предложил начать.
+    if kind == "bundle":
+        return await create_bundle(user_id, plan["bundle"])
+
     db = await _conn()
     try:
         if plan["days"] is None:
+            n = int(plan.get("readings") or 1)
             await db.execute(
-                "UPDATE users SET paid_readings_left = paid_readings_left + 1 WHERE user_id = ?",
-                (user_id,),
+                "UPDATE users SET paid_readings_left = paid_readings_left + ? "
+                "WHERE user_id = ?",
+                (n, user_id),
             )
         else:
             row = await (await db.execute(
@@ -454,14 +522,345 @@ async def apply_purchase(user_id: int, plan_key: str) -> None:
                 (new_until.isoformat(), user_id),
             )
         await db.commit()
+        return None
     finally:
         await db.close()
+
+
+# ---------- Бандлы ----------
+
+async def create_bundle(user_id: int, kind: str) -> int:
+    db = await _conn()
+    try:
+        cur = await db.execute(
+            "INSERT INTO bundles (user_id, kind, status, created_at) "
+            "VALUES (?, ?, 'new', ?)",
+            (user_id, kind, now_iso()),
+        )
+        await db.commit()
+        return cur.lastrowid
+    finally:
+        await db.close()
+
+
+async def get_bundle(bundle_id: int) -> aiosqlite.Row | None:
+    db = await _conn()
+    try:
+        cur = await db.execute("SELECT * FROM bundles WHERE id = ?", (bundle_id,))
+        return await cur.fetchone()
+    finally:
+        await db.close()
+
+
+async def open_bundles(user_id: int, kind: str | None = None) -> list[aiosqlite.Row]:
+    """Незавершённые бандлы человека (оплаченные, но не доигранные)."""
+    db = await _conn()
+    try:
+        sql = "SELECT * FROM bundles WHERE user_id = ? AND status != 'done'"
+        args: tuple = (user_id,)
+        if kind:
+            sql += " AND kind = ?"
+            args += (kind,)
+        cur = await db.execute(sql + " ORDER BY id", args)
+        return list(await cur.fetchall())
+    finally:
+        await db.close()
+
+
+async def start_bundle(
+    bundle_id: int, intro: dict, day0_reading_id: int,
+    schedule: list[tuple[int, int]], marker: str | None = None,
+) -> None:
+    """День 0 сделан: фиксируем ответы входа, расклад и расписание шагов.
+
+    schedule — [(step_no, дней_от_сегодня), …]. Даты считаем один раз здесь,
+    чтобы сдвиг настроек в .env не переписывал расписание уже идущих разборов."""
+    today = datetime.now(timezone.utc)
+    db = await _conn()
+    try:
+        await db.execute(
+            """UPDATE bundles SET status = 'active', intro = ?, marker = ?,
+                                  day0_reading_id = ?, started_at = ?
+               WHERE id = ?""",
+            (json.dumps(intro, ensure_ascii=False), marker, day0_reading_id,
+             now_iso(), bundle_id),
+        )
+        row = await (await db.execute(
+            "SELECT user_id FROM bundles WHERE id = ?", (bundle_id,))).fetchone()
+        user_id = row["user_id"] if row else 0
+        # Пересоздаём шаги: повторный запуск того же бандла не должен
+        # оставлять два расписания
+        await db.execute("DELETE FROM bundle_steps WHERE bundle_id = ?", (bundle_id,))
+        for step_no, days in schedule:
+            due = (today + timedelta(days=days)).astimezone(
+                ZoneInfo(config.TIMEZONE)).strftime("%Y-%m-%d")
+            await db.execute(
+                """INSERT INTO bundle_steps (bundle_id, user_id, step_no, due_date)
+                   VALUES (?, ?, ?, ?)""",
+                (bundle_id, user_id, step_no, due),
+            )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def unstarted_bundles(hours: int = 20) -> list[aiosqlite.Row]:
+    """Оплачен, но так и не начат. Самый дорогой из возможных провалов:
+    человек отдал деньги и не получил ничего — напоминаем ровно один раз."""
+    cutoff = (now_utc() - timedelta(hours=hours)).isoformat()
+    db = await _conn()
+    try:
+        cur = await db.execute(
+            """SELECT b.*, COALESCE(u.display_name, u.first_name, 'дорогая') AS name
+               FROM bundles b JOIN users u ON u.user_id = b.user_id
+               WHERE b.status = 'new' AND b.reminded_at IS NULL
+                 AND b.created_at <= ?""",
+            (cutoff,),
+        )
+        return list(await cur.fetchall())
+    finally:
+        await db.close()
+
+
+async def mark_bundle_reminded(bundle_id: int) -> None:
+    db = await _conn()
+    try:
+        await db.execute(
+            "UPDATE bundles SET reminded_at = ? WHERE id = ?", (now_iso(), bundle_id))
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def set_bundle_marker(bundle_id: int, marker: str | None) -> None:
+    db = await _conn()
+    try:
+        await db.execute(
+            "UPDATE bundles SET marker = ? WHERE id = ?", (marker, bundle_id))
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def finish_bundle(bundle_id: int) -> None:
+    db = await _conn()
+    try:
+        await db.execute(
+            "UPDATE bundles SET status = 'done', finished_at = ? WHERE id = ?",
+            (now_iso(), bundle_id),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def due_bundle_steps(today: str) -> list[aiosqlite.Row]:
+    """Шаги, до которых дошла дата и о которых ещё не спрашивали.
+
+    ⚠️ Не больше одного шага на разбор за раз (условие по MIN(step_no)).
+    Иначе после суток простоя бот вываливал бы человеку весь бандл за одно
+    утро: и вопрос третьего дня, и седьмого, и сразу закрывающее письмо.
+    С этим условием расписание само нагоняет отставание — по шагу в день,
+    и порядок никогда не нарушается."""
+    db = await _conn()
+    try:
+        cur = await db.execute(
+            """SELECT s.*, b.kind, b.intro, b.marker, b.status,
+                      COALESCE(u.display_name, u.first_name, 'дорогая') AS name
+               FROM bundle_steps s
+               JOIN bundles b ON b.id = s.bundle_id
+               JOIN users u ON u.user_id = s.user_id
+               WHERE s.done = 0 AND s.asked_at IS NULL AND s.due_date <= ?
+                 AND b.status = 'active'
+                 AND s.step_no = (SELECT MIN(step_no) FROM bundle_steps s2
+                                   WHERE s2.bundle_id = s.bundle_id AND s2.done = 0)
+               ORDER BY s.due_date, s.step_no""",
+            (today,),
+        )
+        return list(await cur.fetchall())
+    finally:
+        await db.close()
+
+
+async def overdue_bundle_steps(today: str) -> list[aiosqlite.Row]:
+    """Шаги, про которые спросили раньше сегодняшнего дня, а ответа нет.
+    Их пора раскладывать без ответа: разбор не должен вставать из-за молчания."""
+    db = await _conn()
+    try:
+        cur = await db.execute(
+            """SELECT s.*, b.kind, b.intro, b.marker, b.status,
+                      COALESCE(u.display_name, u.first_name, 'дорогая') AS name
+               FROM bundle_steps s
+               JOIN bundles b ON b.id = s.bundle_id
+               JOIN users u ON u.user_id = s.user_id
+               WHERE s.done = 0 AND s.asked_at IS NOT NULL
+                 AND substr(s.asked_at, 1, 10) < ?
+                 AND b.status = 'active'
+                 AND s.step_no = (SELECT MIN(step_no) FROM bundle_steps s2
+                                   WHERE s2.bundle_id = s.bundle_id AND s2.done = 0)
+               ORDER BY s.due_date, s.step_no""",
+            (today,),
+        )
+        return list(await cur.fetchall())
+    finally:
+        await db.close()
+
+
+async def get_bundle_step(step_id: int) -> aiosqlite.Row | None:
+    db = await _conn()
+    try:
+        cur = await db.execute(
+            """SELECT s.*, b.kind, b.intro, b.marker, b.status
+               FROM bundle_steps s JOIN bundles b ON b.id = s.bundle_id
+               WHERE s.id = ?""",
+            (step_id,),
+        )
+        return await cur.fetchone()
+    finally:
+        await db.close()
+
+
+async def awaiting_step(user_id: int) -> aiosqlite.Row | None:
+    """Шаг, про который человека спросили и ждут ответа. Нужен, чтобы поймать
+    свободный текст в чате: она отвечает боту, а не жмёт кнопку."""
+    db = await _conn()
+    try:
+        cur = await db.execute(
+            """SELECT s.*, b.kind, b.intro, b.marker
+               FROM bundle_steps s JOIN bundles b ON b.id = s.bundle_id
+               WHERE s.user_id = ? AND s.done = 0 AND s.asked_at IS NOT NULL
+                 AND b.status = 'active'
+               ORDER BY s.asked_at DESC LIMIT 1""",
+            (user_id,),
+        )
+        return await cur.fetchone()
+    finally:
+        await db.close()
+
+
+async def mark_step_asked(step_id: int) -> None:
+    db = await _conn()
+    try:
+        await db.execute(
+            "UPDATE bundle_steps SET asked_at = ? WHERE id = ?", (now_iso(), step_id))
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def set_step_answer(step_id: int, answer: str) -> None:
+    db = await _conn()
+    try:
+        await db.execute(
+            "UPDATE bundle_steps SET answer = ? WHERE id = ?",
+            (answer[:1000], step_id),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def complete_step(step_id: int, reading_id: int | None = None) -> bool:
+    """Шаг закрыт. Возвращает True только при первом закрытии — защита от
+    двойной выдачи, если она нажала кнопку и одновременно сработала рассылка."""
+    db = await _conn()
+    try:
+        cur = await db.execute(
+            "UPDATE bundle_steps SET done = 1, reading_id = ? WHERE id = ? AND done = 0",
+            (reading_id, step_id),
+        )
+        await db.commit()
+        return cur.rowcount == 1
+    finally:
+        await db.close()
+
+
+async def claim_step(step_id: int) -> bool:
+    """Атомарно занимает шаг под выдачу: помечает done=1 до генерации.
+    Иначе долгая генерация успевает пересечься со следующим тиком рассылки,
+    и человек получает один и тот же расклад дважды."""
+    return await complete_step(step_id, None)
+
+
+async def release_step(step_id: int) -> None:
+    """Вернуть шаг в очередь, если генерация сорвалась."""
+    db = await _conn()
+    try:
+        await db.execute(
+            "UPDATE bundle_steps SET done = 0 WHERE id = ? AND reading_id IS NULL",
+            (step_id,),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def attach_reading_to_step(step_id: int, reading_id: int) -> None:
+    db = await _conn()
+    try:
+        await db.execute(
+            "UPDATE bundle_steps SET reading_id = ? WHERE id = ?",
+            (reading_id, step_id),
+        )
+        await db.commit()
+    finally:
+        await db.close()
+
+
+async def bundle_readings(bundle_id: int) -> list[aiosqlite.Row]:
+    """Все расклады разбора по порядку — материал для следующего шага
+    и для финального письма."""
+    db = await _conn()
+    try:
+        cur = await db.execute(
+            """SELECT id, topic, question, cards, reading_text, created_at
+               FROM readings WHERE bundle_id = ? ORDER BY id""",
+            (bundle_id,),
+        )
+        return list(await cur.fetchall())
+    finally:
+        await db.close()
+
+
+async def bundle_answers(bundle_id: int) -> list[str]:
+    """Что она рассказывала между шагами, по порядку."""
+    db = await _conn()
+    try:
+        cur = await db.execute(
+            """SELECT answer FROM bundle_steps
+               WHERE bundle_id = ? AND answer IS NOT NULL AND answer != ''
+               ORDER BY step_no""",
+            (bundle_id,),
+        )
+        return [r["answer"] for r in await cur.fetchall()]
+    finally:
+        await db.close()
+
+
+async def bundle_repeat_card(bundle_id: int) -> str | None:
+    """Карта, выпавшая за разбор больше одного раза. Именно она делает
+    финальное письмо тем, чего не даст ни один отдельный расклад."""
+    rows = await bundle_readings(bundle_id)
+    counts: dict[str, int] = {}
+    for r in rows:
+        try:
+            for c in json.loads(r["cards"] or "[]"):
+                name = str(c.get("name") or "").strip()
+                if name:
+                    counts[name] = counts.get(name, 0) + 1
+        except (ValueError, TypeError, KeyError):
+            continue
+    if not counts:
+        return None
+    name, n = max(counts.items(), key=lambda x: x[1])
+    return f"{name} — {n} раза" if n > 1 else None
 
 
 # ---------- Расклады ----------
 
 async def add_reading(
-    user_id: int, topic: str, question: str, drawn: list[dict], reading_text: str
+    user_id: int, topic: str, question: str, drawn: list[dict], reading_text: str,
+    bundle_id: int | None = None,
 ) -> tuple[int, int]:
     """Сохраняет расклад. Возвращает (reading_id, порядковый номер расклада у пользователя)."""
     cards_json = json.dumps(
@@ -471,9 +870,11 @@ async def add_reading(
     db = await _conn()
     try:
         cur = await db.execute(
-            """INSERT INTO readings (user_id, topic, question, cards, reading_text, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (user_id, topic, question[:1000], cards_json, reading_text, now_iso()),
+            """INSERT INTO readings (user_id, topic, question, cards, reading_text,
+                                     created_at, bundle_id)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (user_id, topic, question[:1000], cards_json, reading_text, now_iso(),
+             bundle_id),
         )
         reading_id = cur.lastrowid
         await db.execute(
@@ -505,6 +906,42 @@ async def set_reading_rating(reading_id: int, user_id: int, value: int) -> bool:
         )
         await db.commit()
         return cur.rowcount == 1
+    finally:
+        await db.close()
+
+
+async def get_reading(reading_id: int) -> aiosqlite.Row | None:
+    db = await _conn()
+    try:
+        cur = await db.execute("SELECT * FROM readings WHERE id = ?", (reading_id,))
+        return await cur.fetchone()
+    finally:
+        await db.close()
+
+
+async def spent_rub(user_id: int) -> float:
+    """Сколько человек уже заплатил рублями. Нужно, чтобы предлагать подписку
+    арифметикой («ты взяла на 300 ₽, месяц стоит 299»), а не витриной."""
+    db = await _conn()
+    try:
+        row = await (await db.execute(
+            """SELECT COALESCE(SUM(amount), 0) FROM payments
+               WHERE user_id = ? AND status = 'succeeded' AND currency = 'RUB'""",
+            (user_id,),
+        )).fetchone()
+        return float(row[0] or 0)
+    finally:
+        await db.close()
+
+
+async def paid_count(user_id: int) -> int:
+    db = await _conn()
+    try:
+        row = await (await db.execute(
+            "SELECT COUNT(*) FROM payments WHERE user_id = ? AND status = 'succeeded'",
+            (user_id,),
+        )).fetchone()
+        return int(row[0] or 0)
     finally:
         await db.close()
 
@@ -904,6 +1341,13 @@ async def stats_snapshot() -> dict:
         )
         rate_up = await one("SELECT COUNT(*) FROM readings WHERE rating = 1")
         rate_down = await one("SELECT COUNT(*) FROM readings WHERE rating = -1")
+        # Бандлы: куплено всего, идёт сейчас, доиграно до финального письма.
+        # 'new' отдельно — это оплаченные, но так и не начатые: если их много,
+        # значит экран «начнём?» после оплаты не работает.
+        b_total = await one("SELECT COUNT(*) FROM bundles")
+        b_new = await one("SELECT COUNT(*) FROM bundles WHERE status = 'new'")
+        b_active = await one("SELECT COUNT(*) FROM bundles WHERE status = 'active'")
+        b_done = await one("SELECT COUNT(*) FROM bundles WHERE status = 'done'")
 
         # По источнику важны не старты, а поведение: шесть человек, сделавших
         # по три расклада, и шесть отвалившихся после первого — разные шесть.
@@ -928,6 +1372,8 @@ async def stats_snapshot() -> dict:
             "subs": int(subs), "daily": int(daily), "daily_off": int(daily_off),
             "sources": sources,
             "rate_up": int(rate_up), "rate_down": int(rate_down),
+            "b_total": int(b_total), "b_new": int(b_new),
+            "b_active": int(b_active), "b_done": int(b_done),
         }
     finally:
         await db.close()

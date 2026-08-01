@@ -8,6 +8,7 @@ from aiogram.types import (
     WebAppInfo,
 )
 
+import bundles
 import config
 
 
@@ -66,35 +67,132 @@ def chips_reply(chips: list[str]) -> ReplyKeyboardMarkup:
     )
 
 
-def spreads(is_sub: bool = False) -> InlineKeyboardMarkup:
+def spreads(is_sub: bool = False, bundle_keys: list[str] | None = None,
+            active: set[str] | None = None) -> InlineKeyboardMarkup:
     """Меню раскладов. Премиум-расклад показываем всем — но без подписки
-    он с замком: витрина важнее, чем спрятанная кнопка."""
+    он с замком: витрина важнее, чем спрятанная кнопка.
+
+    Бандлы стоят здесь же, а не в «Тарифах»: «хочу разобраться с ним» —
+    это намерение выбрать расклад, а не совершить покупку. Она выбирает
+    продукт, оплата идёт следствием."""
     celtic = ("🕯 Кельтский крест — 10 карт" if is_sub
               else "🕯 Кельтский крест — 10 карт 🔒")
-    return _kb([
+    rows = [
         [InlineKeyboardButton(text="🔮 Три карты — классика", callback_data="spread:classic")],
         [InlineKeyboardButton(text="⚡ Да или нет", callback_data="spread:yesno")],
         [InlineKeyboardButton(text="🔀 Выбор из двух", callback_data="spread:choice")],
         [InlineKeyboardButton(text="💔 Что он чувствует", callback_data="spread:feelings")],
         [InlineKeyboardButton(text="🗓 Неделя вперёд", callback_data="spread:week")],
         [InlineKeyboardButton(text=celtic, callback_data="spread:celtic")],
-        [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")],
-    ])
+    ]
+    active = active or set()
+    for key in (bundle_keys or []):
+        b = bundles.get(key)
+        if not b:
+            continue
+        if key in active:
+            label = f"{b['emoji']} {b['title']} — идёт"
+        else:
+            label = f"{b['emoji']} {b['title']} — {config.PRICE_BUNDLE_RUB} ₽"
+        rows.append([InlineKeyboardButton(text=label, callback_data=f"bundle:show:{key}")])
+    rows.append([InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")])
+    return _kb(rows)
 
 
 def sub_plans(back: str = "new_reading") -> InlineKeyboardMarkup:
-    """Кнопки под «закрытым» экраном премиум-фичи: только подписки."""
+    """Кнопки под «закрытым» экраном фичи из подписки. Недельного тарифа
+    больше нет — при месяце в 299 ₽ он не отличим от пакета."""
     p = config.PLANS
     return _kb([
         [InlineKeyboardButton(
-            text=f"🗓 Неделя — {p['week']['rub']} ₽", callback_data="buy:week")],
-        [InlineKeyboardButton(
-            text=f"🌙 Месяц — {p['month']['rub']} ₽", callback_data="buy:month")],
+            text=f"🖤 Месяц со мной — {p['month']['rub']} ₽", callback_data="buy:month")],
         [
             InlineKeyboardButton(text="💳 Все тарифы", callback_data="tariffs"),
             InlineKeyboardButton(text="⬅️ Назад", callback_data=back),
         ],
     ])
+
+
+def pack_offer(back: str = "menu") -> InlineKeyboardMarkup:
+    """Пейволл и «кончился остаток»: продаём пакет, а не подписку."""
+    p = config.PLANS
+    return _kb([
+        [InlineKeyboardButton(
+            text=f"🔮 {config.PACK_READINGS} раскладов — {p['pack5']['rub']} ₽",
+            callback_data="buy:pack5")],
+        [InlineKeyboardButton(
+            text=f"✨ 1 расклад — {p['single']['rub']} ₽", callback_data="buy:single")],
+        [
+            InlineKeyboardButton(text="💳 Все тарифы", callback_data="tariffs"),
+            InlineKeyboardButton(text="⬅️ В меню", callback_data=back),
+        ],
+    ])
+
+
+def continue_offer() -> InlineKeyboardMarkup:
+    """Реплики кончились посреди разговора — единственная кнопка, которая
+    здесь нужна: продолжить именно этот разговор."""
+    return _kb([
+        [InlineKeyboardButton(
+            text=f"💬 Продолжить — {config.PRICE_SINGLE_RUB} ₽",
+            callback_data="buy:single")],
+        [
+            InlineKeyboardButton(text="🔮 Новый расклад", callback_data="new_reading"),
+            InlineKeyboardButton(text="🏠 В меню", callback_data="menu"),
+        ],
+    ])
+
+
+def bundle_offer(key: str, back: str = "new_reading") -> InlineKeyboardMarkup:
+    """Экран объяснения бандла: одна кнопка покупки, без списка альтернатив."""
+    b = bundles.get(key)
+    plan_key = b["plan"] if b else "bundle_him"
+    title = b["title"] if b else "разбор"
+    return _kb([
+        [InlineKeyboardButton(
+            text=f"Взять «{title}» — {config.PRICE_BUNDLE_RUB} ₽",
+            callback_data=f"buy:{plan_key}")],
+        [
+            InlineKeyboardButton(text="💳 Все тарифы", callback_data="tariffs"),
+            InlineKeyboardButton(text="⬅️ Назад", callback_data=back),
+        ],
+    ])
+
+
+def bundle_start(bundle_id: int) -> InlineKeyboardMarkup:
+    return _kb([
+        [InlineKeyboardButton(text="Начнём 🖤", callback_data=f"bundle:start:{bundle_id}")],
+    ])
+
+
+def bundle_step(step_id: int) -> InlineKeyboardMarkup:
+    """Шаг бандла: рассказать или сразу раскладывать. Расклад не должен
+    зависеть от её ответа — иначе это форма, а не разговор."""
+    return _kb([
+        [InlineKeyboardButton(text="🔮 Просто разложи",
+                              callback_data=f"bundle:go:{step_id}")],
+    ])
+
+
+def bundle_done(key: str) -> InlineKeyboardMarkup:
+    """После финального письма. Для «Месяца вперёд» — тот же бандл ещё раз:
+    единственный, у которого есть естественный повтор."""
+    rows = []
+    b = bundles.get(key)
+    if b and config.BUNDLES_ENABLED:
+        if key == "month":
+            rows.append([InlineKeyboardButton(
+                text=f"🌙 Ещё месяц — {config.PRICE_BUNDLE_RUB} ₽",
+                callback_data="bundle:show:month")])
+        else:
+            rows.append([InlineKeyboardButton(
+                text="🌙 Посмотреть «Месяц вперёд»",
+                callback_data="bundle:show:month")])
+    rows.append([
+        InlineKeyboardButton(text="🔮 Разложить карты", callback_data="new_reading"),
+        InlineKeyboardButton(text="🏠 В меню", callback_data="menu"),
+    ])
+    return _kb(rows)
 
 
 def topics() -> InlineKeyboardMarkup:
@@ -130,16 +228,31 @@ def to_reading() -> InlineKeyboardMarkup:
 
 
 def plans() -> InlineKeyboardMarkup:
+    """Полная лестница — только на экране «💳 Тарифы», куда человек пришёл сам.
+    Во всех остальных точках показываем одно предложение под момент."""
     p = config.PLANS
-    return _kb([
+    rows = [
         [InlineKeyboardButton(
-            text=f"🔮 1 расклад — {p['single']['rub']} ₽", callback_data="buy:single")],
+            text=f"✨ 1 расклад — {p['single']['rub']} ₽", callback_data="buy:single")],
         [InlineKeyboardButton(
-            text=f"🗓 Неделя — {p['week']['rub']} ₽", callback_data="buy:week")],
+            text=f"🔮 {config.PACK_READINGS} раскладов — {p['pack5']['rub']} ₽",
+            callback_data="buy:pack5")],
+    ]
+    if config.BUNDLES_ENABLED:
+        rows += [
+            [InlineKeyboardButton(
+                text=f"💞 «Он и я» — {p['bundle_him']['rub']} ₽",
+                callback_data="bundle:show:him")],
+            [InlineKeyboardButton(
+                text=f"🌙 «Месяц вперёд» — {p['bundle_month']['rub']} ₽",
+                callback_data="bundle:show:month")],
+        ]
+    rows += [
         [InlineKeyboardButton(
-            text=f"🌙 Месяц — {p['month']['rub']} ₽", callback_data="buy:month")],
+            text=f"🖤 Месяц со мной — {p['month']['rub']} ₽", callback_data="buy:month")],
         [InlineKeyboardButton(text="⬅️ В меню", callback_data="menu")],
-    ])
+    ]
+    return _kb(rows)
 
 
 def pay_methods(plan_key: str) -> InlineKeyboardMarkup:

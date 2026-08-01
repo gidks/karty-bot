@@ -38,14 +38,32 @@ async def main() -> None:
     dp = Dispatcher(storage=MemoryStorage())
     dp.include_router(handlers.router)
 
-    await bot.set_my_commands([
-        BotCommand(command="start", description="Начать"),
-        BotCommand(command="menu", description="Меню"),
-        BotCommand(command="help", description="Как это работает"),
-    ])
+    # Движку бандлов нужно хранилище FSM: шаг может прийти из фоновой задачи,
+    # у которой своего FSMContext нет, а разговор после расклада всё равно
+    # должен начаться — иначе её следующая реплика улетит в пустоту.
+    import bundle_run
+
+    bundle_run.bind(dp.storage, handlers.Reading.in_dialogue)
+
+    # Список команд в меню и сброс вебхука — вещи косметические, но оба ходят в
+    # Telegram до старта полинга. В этом ДЦ связь с api.telegram.org иногда
+    # отваливается (см. /etc/hosts), и таймаут здесь ронял весь процесс: бот
+    # умирал, не начав работать. Полинг сам умеет ждать и переподключаться,
+    # поэтому пускаем его в любом случае.
+    try:
+        await bot.set_my_commands([
+            BotCommand(command="start", description="Начать"),
+            BotCommand(command="menu", description="Меню"),
+            BotCommand(command="help", description="Как это работает"),
+        ])
+    except Exception as e:  # noqa: BLE001 — меню команд не повод не запускаться
+        log.warning("не удалось обновить меню команд: %s", e)
 
     sched = scheduler.setup(bot)
-    await bot.delete_webhook(drop_pending_updates=True)
+    try:
+        await bot.delete_webhook(drop_pending_updates=True)
+    except Exception as e:  # noqa: BLE001 — вебхука у нас и так нет
+        log.warning("не удалось сбросить вебхук: %s", e)
     log.info("Бот запущен. Модель: %s | ЮKassa: %s",
              config.LLM_MODEL, "вкл" if config.yookassa_available() else "выкл")
     try:

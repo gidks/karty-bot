@@ -5,6 +5,7 @@ import asyncio
 import os
 import sys
 import tempfile
+from datetime import timedelta
 
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("LLM_API_KEY", "test")
@@ -15,6 +16,7 @@ os.environ["DB_PATH"] = DB_FILE
 
 import aiosqlite  # noqa: E402
 
+import bundles  # noqa: E402
 import config  # noqa: E402
 import database as db  # noqa: E402
 import handlers  # noqa: E402
@@ -47,38 +49,49 @@ def test_texts() -> None:
         def __getitem__(self, k):
             return dict.__getitem__(self, k)
 
-    paywall = texts.PAYWALL.format(
-        name="Аня", topup=texts.topup_promise(),
-        p_single=config.PRICE_SINGLE_RUB, p_week=config.PRICE_WEEK_RUB,
-        p_month=config.PRICE_MONTH_RUB, benefits=texts.sub_benefits(),
-    )
-    check("PAYWALL собирается", "79" in paywall and "Кельтский крест" in paywall)
+    paywall = handlers._paywall_text({"display_name": "Аня", "first_name": None})
+    check("PAYWALL собирается",
+          str(config.PRICE_PACK_RUB) in paywall and "Аня" in paywall)
+    check("PAYWALL продаёт пакет, а не подписку",
+          str(config.PACK_READINGS) in paywall and "Подписка" not in paywall)
     check("PAYWALL обещает пополнение", "начислю" in paywall)
     check("PAYWALL без «без лимита»", "без лимита" not in paywall)
 
     tariffs = texts.TARIFFS.format(
-        p_single=79, p_week=249, p_month=599, left="свободных раскладов нет",
+        ladder=texts.ladder_lines(), left="свободных раскладов нет",
         benefits=texts.sub_benefits(), free_note=texts.free_note(),
     )
     check("TARIFFS собирается", "Разбор месяца" in tariffs)
+    check("TARIFFS показывает всю лестницу",
+          all(str(config.PLANS[k]["rub"]) in tariffs
+              for k in ("single", "pack5", "month")))
+    check("недельного тарифа на витрине нет",
+          "Неделя —" not in tariffs and "week" not in config.PLANS)
 
     check("HELP собирается",
           "Кельтский крест" in texts.HELP.format(
               free_terms=texts.free_terms(), support="@s"))
     check("CELTIC_LOCKED собирается",
-          "249" in texts.CELTIC_LOCKED.format(
-              benefits=texts.sub_benefits(), p_week=249, p_month=599))
+          "299" in texts.CELTIC_LOCKED.format(
+              benefits=texts.sub_benefits(), p_month=299))
     check("REVIEW_LOCKED собирается",
-          "599" in texts.REVIEW_LOCKED.format(
-              benefits=texts.sub_benefits(), p_week=249, p_month=599))
+          "299" in texts.REVIEW_LOCKED.format(
+              benefits=texts.sub_benefits(), p_month=299))
     check("REVIEW_NOT_ENOUGH собирается",
           "3" in texts.REVIEW_NOT_ENOUGH.format(n=3, have="1 расклад"))
     check("REVIEW_COOLDOWN собирается",
           "дней" in texts.REVIEW_COOLDOWN.format(days=texts.days_phrase(5)))
     check("REVIEW_HEADER собирается",
           "5 раскладов" in texts.REVIEW_HEADER.format(n=texts.readings_phrase(5)))
-    check("DIALOGUE_LIMIT собирается",
-          "30" in texts.DIALOGUE_LIMIT.format(sub=30, free=5))
+    check("DIALOGUE_LIMIT собирается", "🖤" in texts.DIALOGUE_LIMIT)
+    offer = texts.DIALOGUE_LIMIT_OFFER.format(
+        free=5, p_single=config.PRICE_SINGLE_RUB,
+        d_paid=config.DIALOGUE_MAX_PAID, next_free="в понедельник")
+    check("оффер на исчерпании реплик собирается",
+          str(config.PRICE_SINGLE_RUB) in offer
+          and str(config.DIALOGUE_MAX_PAID) in offer)
+    check("DIALOGUE_UNLOCKED собирается",
+          "10" in texts.DIALOGUE_UNLOCKED.format(d_paid=10))
     check("DIALOGUE_LIMIT_SUB собирается",
           "20" in texts.DIALOGUE_LIMIT_SUB.format(n=20))
     check("DIALOGUE_LIMIT_SUB_MONTH собирается",
@@ -127,6 +140,12 @@ def test_texts() -> None:
           "следующий бесплатный" in texts.balance_line(0, 0, None))
     check("_paywall_text работает на строке-словаре",
           "Аня" in handlers._paywall_text(row))
+    check("balance_short молчит на пустом балансе",
+          texts.balance_short(0, 0, None) == "")
+    check("balance_short показывает остаток",
+          "3 расклада" in texts.balance_short(1, 2, None))
+    check("balance_short у подписчицы — про подписку",
+          "подписка" in texts.balance_short(0, 0, "01.09 12:00"))
 
 
 # ---------- 2. Кельтский крест ----------
@@ -145,6 +164,8 @@ def test_celtic() -> None:
     check("расклад премиальный", "celtic" in config.PREMIUM_SPREADS)
     check("Mini App для него отключён", "celtic" in handlers.NO_APP_SPREADS)
     check("max_tokens поднят", handlers._max_tokens("celtic") == 2600)
+    check("справочники общие с промптами",
+          handlers.SPREAD_CARDS is prompts.SPREAD_CARD_COUNT)
     check("max_tokens прочих не изменился",
           handlers._max_tokens("classic") == 1300
           and handlers._max_tokens("yesno") == 500
@@ -177,14 +198,31 @@ def test_keyboards() -> None:
     check("кнопка разбора месяца в меню",
           any("Разбор месяца" in b.text
               for r in kb.main_menu().inline_keyboard for b in r))
-    check("sub_plans: только подписки",
-          [b.callback_data for r in kb.sub_plans().inline_keyboard for b in r][:2]
-          == ["buy:week", "buy:month"])
+    check("sub_plans: остался только месяц",
+          [b.callback_data for r in kb.sub_plans().inline_keyboard for b in r][:1]
+          == ["buy:month"])
+    check("нигде не покупается снятый недельный тариф",
+          not any(b.callback_data == "buy:week"
+                  for m in (kb.plans(), kb.sub_plans(), kb.pack_offer())
+                  for r in m.inline_keyboard for b in r))
     check("sub_plans: настраиваемая кнопка «назад»",
           any(b.callback_data == "menu"
               for r in kb.sub_plans(back="menu").inline_keyboard for b in r))
-    check("цена разового в тарифах — 79",
-          any("79" in b.text for r in kb.plans().inline_keyboard for b in r))
+    check("цена разового в тарифах — 49",
+          any("49" in b.text for r in kb.plans().inline_keyboard for b in r))
+    check("пейволл предлагает пакет первым",
+          kb.pack_offer().inline_keyboard[0][0].callback_data == "buy:pack5")
+    check("на исчерпании реплик одна кнопка — продолжить",
+          kb.continue_offer().inline_keyboard[0][0].callback_data == "buy:single")
+    bundle_menu = [b.callback_data
+                   for r in kb.spreads(False, bundle_keys=["him", "month"]).inline_keyboard
+                   for b in r]
+    check("бандлы живут в меню раскладов, а не в тарифах",
+          "bundle:show:him" in bundle_menu and "bundle:show:month" in bundle_menu)
+    running = [b.text for r in kb.spreads(
+        False, bundle_keys=["him"], active={"him"}).inline_keyboard for b in r]
+    check("идущий бандл показан как идущий, а не как цена",
+          any("идёт" in t for t in running))
 
 
 # ---------- 4. База: миграция, пополнение, лимиты ----------
@@ -547,6 +585,305 @@ async def test_mood_images() -> None:
     config.MOOD_COUNT = saved
 
 
+
+
+# ---------- 6. Лестница цен и пакеты ----------
+
+def test_ladder() -> None:
+    print("\n[лестница цен]")
+    check("вход подешевел вдвое", config.PRICE_SINGLE_RUB <= 49)
+    check("месяц подешевел вдвое", config.PRICE_MONTH_RUB <= 299)
+    check("недельного тарифа нет в продаже", "week" not in config.PLANS)
+    check("но старый платёж на неделю всё ещё отрабатывается",
+          config.plan("week") is not None and config.plan("week")["days"] == 7)
+    check("неизвестный тариф не роняет", config.plan("нет такого") is None)
+
+    kinds = {k: v.get("kind") for k, v in config.PLANS.items()}
+    check("у каждой ступени есть тип", all(kinds.values()), str(kinds))
+    check("пакет даёт больше одного расклада",
+          config.PLANS["pack5"]["readings"] == config.PACK_READINGS
+          and config.PACK_READINGS > 1)
+    per = config.PRICE_PACK_RUB / config.PACK_READINGS
+    check("в пакете расклад дешевле, чем поштучно",
+          per < config.PRICE_SINGLE_RUB, f"({per:.0f} vs {config.PRICE_SINGLE_RUB})")
+    check("бандл дороже пакета, но дешевле месяца",
+          config.PRICE_PACK_RUB < config.PRICE_BUNDLE_RUB <= config.PRICE_MONTH_RUB)
+    check("лестница на витрине без дыр",
+          all(k in config.PLANS for k in config.LADDER))
+
+    check("после оплаты каждого тарифа есть что сказать",
+          all("{" not in texts.pay_success(k) for k in config.PLANS))
+    check("и у снятого с продажи тоже", "✅" in texts.pay_success("week"))
+    check("неизвестный тариф не падает после оплаты",
+          "✅" in texts.pay_success("что-то-новое"))
+
+
+async def test_purchases() -> None:
+    print("\n[что начисляет покупка]")
+    await _fresh_db()
+    await _mk_user(1)
+
+    await db.apply_purchase(1, "single")
+    check("разовый даёт один расклад", (await db.get_user(1))["paid_readings_left"] == 1)
+
+    await db.apply_purchase(1, "pack5")
+    check(f"пакет даёт сразу {config.PACK_READINGS}",
+          (await db.get_user(1))["paid_readings_left"] == 1 + config.PACK_READINGS)
+
+    await db.apply_purchase(1, "month")
+    row = await db.get_user(1)
+    check("месяц включает подписку", db.sub_active(row))
+
+    # Незакрытый платёж со снятым тарифом обязан отработать, а не упасть:
+    # деньги уже списаны
+    await _mk_user(2)
+    await db.apply_purchase(2, "week")
+    check("старый недельный платёж всё ещё включает подписку",
+          db.sub_active(await db.get_user(2)))
+    check("несуществующий тариф просто ничего не делает",
+          await db.apply_purchase(2, "нет-такого") is None)
+
+    bid = await db.apply_purchase(1, "bundle_him")
+    check("бандл не начисляет расклады, а заводит разбор", isinstance(bid, int))
+    b = await db.get_bundle(bid)
+    check("новый бандл ждёт начала", b["status"] == "new" and b["kind"] == "him")
+    check("остаток раскладов бандлом не тронут",
+          (await db.get_user(1))["paid_readings_left"] == 1 + config.PACK_READINGS)
+
+
+def test_dialogue_tiers() -> None:
+    print("\n[лимиты реплик по тарифам]")
+    check("бесплатный расклад — затравка",
+          handlers._dialogue_limit("free") == config.DIALOGUE_MAX)
+    check("платный ощутимо длиннее",
+          handlers._dialogue_limit("paid") == config.DIALOGUE_MAX_PAID
+          and config.DIALOGUE_MAX_PAID > config.DIALOGUE_MAX)
+    check("бандл — самый длинный разговор",
+          config.DIALOGUE_MAX_BUNDLE > config.DIALOGUE_MAX_PAID)
+    check("шаг бандла тоже не куцый",
+          config.DIALOGUE_MAX_BUNDLE_STEP >= config.DIALOGUE_MAX_PAID)
+
+    # Главное, ради чего лимиты вообще есть: при цене месяца 299 ₽ потолок
+    # расходов на диалог должен быть заметно меньше выручки
+    net = config.PRICE_MONTH_RUB * 0.965
+    worst = min(config.DIALOGUE_MAX_SUB * 30, config.DIALOGUE_MAX_SUB_MONTH) * 1
+    check("диалог подписчицы не съедает половину выручки месяца",
+          worst < net * 0.5, f"({worst} ₽ при выручке {net:.0f} ₽)")
+
+    # Внутри бандла ничего не продаём: она уже заплатила
+    inside = handlers._dialogue_limit_text({"bundle_id": 7}, 25)
+    check("в бандле на исчерпании реплик нет оффера",
+          str(config.PRICE_SINGLE_RUB) not in inside)
+    outside = handlers._dialogue_limit_text({}, 5)
+    check("вне бандла — есть", str(config.PRICE_SINGLE_RUB) in outside)
+
+
+# ---------- 7. Бандлы ----------
+
+def test_bundle_config() -> None:
+    print("\n[сценарии бандлов]")
+    for key in bundles.all_keys():
+        b = bundles.get(key)
+        days = bundles.step_days(key)
+        check(f"«{b['title']}»: дней столько же, сколько шагов",
+              len(days) == len(b["steps"]), f"({days} vs {len(b['steps'])})")
+        check(f"«{b['title']}»: дни строго растут", days == sorted(set(days)))
+        check(f"«{b['title']}»: последний шаг — закрывающее письмо",
+              b["steps"][-1]["kind"] == bundles.STEP_FINAL)
+        check(f"«{b['title']}»: ровно три вопроса на входе",
+              len(b["intro"]) == 3)
+        check(f"«{b['title']}»: у вопросов есть подпись для промпта",
+              all(q.get("label") for q in b["intro"]))
+        check(f"«{b['title']}»: расклад дня 0 известен промптам",
+              b["day0"]["spread"] in prompts.SPREAD_RULES)
+        for st in b["steps"][:-1]:
+            check(f"«{b['title']}»: расклад шага «{st['title']}» известен промптам",
+                  st["spread"] in prompts.SPREAD_RULES)
+            check(f"«{b['title']}»: у шага «{st['title']}» есть текст вопроса",
+                  st["ask"] in texts.BUNDLE_STEP_ASK)
+        check(f"«{b['title']}»: есть экран объяснения", key in texts.BUNDLE_ABOUT)
+        check(f"«{b['title']}»: тариф существует", b["plan"] in config.PLANS)
+        check(f"«{b['title']}»: картинка витрины настроена",
+              bool(config.offer_img_url(b["img"])))
+
+    check("даты берутся из .env",
+          config.bundle_days("2,5,9", [3, 7, 14]) == [2, 5, 9])
+    check("кривая строка не ломает расписание",
+          config.bundle_days("три,семь", [3, 7, 14]) == [3, 7, 14])
+    check("несовпадение по количеству откатывается к умолчанию",
+          bundles.step_days("him") == [3, 7, 14])
+    saved = config.BUNDLE_HIM_DAYS
+    config.BUNDLE_HIM_DAYS = "2,4"      # шагов три, дней два
+    check("два дня на три шага — работаем по умолчанию",
+          bundles.step_days("him") == [3, 7, 14])
+    config.BUNDLE_HIM_DAYS = saved
+
+    saved_on = config.BUNDLES_ENABLED
+    config.BUNDLES_ENABLED = 0
+    check("выключение снимает бандлы с витрины", bundles.on_sale() == [])
+    check("и убирает их из лестницы", "Он и я" not in texts.ladder_lines())
+    config.BUNDLES_ENABLED = saved_on
+
+
+def test_bundle_prompts() -> None:
+    print("\n[промпты бандлов]")
+    drawn = [{"id": i, "name": f"Карта {i}", "rev": False,
+              "essence": "суть", "upright": "прямое", "reversed": "обратное"}
+             for i in range(3)]
+    msgs = prompts.build_bundle_reading_messages(
+        "Он и я", "Что он чувствует", "Аня", drawn, "feelings",
+        intro_answers={"Его зовут": "Артём"},
+        story_block="[1] был расклад", marker="напишет ли первым",
+        her_answer="написал в среду", with_marker=True)
+    sys_text = msgs[0]["content"][0]["text"]
+    user = msgs[1]["content"]
+    check("маркер требуется отдельным блоком", "===МАРКЕР===" in sys_text)
+    check("маркер — наблюдение, а не задание",
+          "«посмотри»" in sys_text and "«напиши ему»" in sys_text)
+    check("правила продолжения подключены", "Продолжай линию" in sys_text)
+    check("её слова первого дня в промпте", "Артём" in user)
+    check("прошлый маркер в промпте", "напишет ли первым" in user)
+    check("её рассказ в промпте", "написал в среду" in user)
+
+    silent = prompts.build_bundle_reading_messages(
+        "Он и я", "Что сдвинулось", "Аня", drawn, "shift",
+        story_block="[1] был расклад")[1]["content"]
+    check("молчание не блокирует расклад",
+          "Она ничего не рассказала" in silent)
+
+    fin = prompts.build_bundle_final_messages(
+        "him", "Он и я", "Аня", "[1] расклад", repeat_card="Луна — 3 раза")
+    fin_sys, fin_user = fin[0]["content"][0]["text"], fin[1]["content"]
+    check("финал не тянет карты", "карты ты сейчас не тянешь" in fin_sys)
+    check("повторяющаяся карта уезжает в письмо", "Луна" in fin_user)
+    no_repeat = prompts.build_bundle_final_messages(
+        "month", "Месяц вперёд", "Аня", "[1]")[1]["content"]
+    check("без повторов модель не выдумывает их",
+          "не выдумывай" in no_repeat)
+
+
+def test_bundle_serial() -> None:
+    print("\n[маркер в разметке ответа]")
+    body = ("===КАРТА 1===\nа\n===КАРТА 2===\nб\n===КАРТА 3===\nв\n"
+            "===ИТОГ===\nвывод\n===ПОДСКАЗКИ===\nага\n"
+            "===МАРКЕР===\nпосмотри, напишет ли он\nпервым до выходных")
+    parsed = serial.parse(body, 3)
+    check("маркер разбирается", parsed and parsed["marker"])
+    check("многострочный маркер сжимается в одну строку",
+          "\n" not in (parsed["marker"] or ""))
+    check("маркер не путается с картами", len(parsed["cards"]) == 3)
+    check("маркер попадает в сохранённый текст",
+          "первым до выходных" in serial.plain_text(parsed))
+    # Старые расклады без маркера не должны сломаться
+    old = serial.parse("===КАРТА 1===\nа\n===ИТОГ===\nб", 1)
+    check("расклад без маркера по-прежнему разбирается",
+          old is not None and old["marker"] is None)
+
+
+async def test_bundle_flow() -> None:
+    print("\n[бандл: расписание и шаги]")
+    await _fresh_db()
+    await _mk_user(1)
+    bid = await db.create_bundle(1, "him")
+    check("бандл заводится в статусе «не начат»",
+          (await db.get_bundle(bid))["status"] == "new")
+    check("он виден как незавершённый", len(await db.open_bundles(1, "him")) == 1)
+
+    rid, _ = await db.add_reading(
+        1, "Он и я", "вопрос",
+        [{"id": 5, "name": "Луна", "rev": False}], "текст дня 0", bid)
+    schedule = [(i, d) for i, (d, _st) in enumerate(bundles.schedule("him"))]
+    await db.start_bundle(bid, {"Его зовут": "Артём"}, rid, schedule,
+                          "посмотри, напишет ли он первым")
+    b = await db.get_bundle(bid)
+    check("после дня 0 бандл активен", b["status"] == "active")
+    check("маркер сохранён", "напишет ли" in b["marker"])
+    check("расклад дня 0 привязан", b["day0_reading_id"] == rid)
+    check("расклады бандла собираются", len(await db.bundle_readings(bid)) == 1)
+
+    today = db.now_utc().strftime("%Y-%m-%d")
+    check("сегодня ни один шаг ещё не подошёл",
+          [r["id"] for r in await db.due_bundle_steps(today)] == [])
+
+    far = (db.now_utc() + timedelta(days=99)).strftime("%Y-%m-%d")
+    due = await db.due_bundle_steps(far)
+    # Даже если бот стоял месяц, за раз выдаём ОДИН шаг: иначе человек получил
+    # бы весь разбор за одно утро, включая закрывающее письмо
+    check("после долгого простоя приезжает только один шаг", len(due) == 1,
+          f"({len(due)})")
+    check("и это самый первый несделанный", due[0]["step_no"] == 0)
+    check("в очередь приезжает и вид бандла, и маркер",
+          due[0]["kind"] == "him" and "напишет ли" in due[0]["marker"])
+
+    step_id = due[0]["id"]
+    await db.mark_step_asked(step_id)
+    check("спрошенный шаг из очереди уходит",
+          step_id not in [r["id"] for r in await db.due_bundle_steps(far)])
+    check("и находится как ожидающий ответа",
+          (await db.awaiting_step(1))["id"] == step_id)
+    check("сегодня он ещё не просрочен",
+          step_id not in [r["id"] for r in await db.overdue_bundle_steps(today)])
+    tomorrow = (db.now_utc() + timedelta(days=1)).strftime("%Y-%m-%d")
+    check("а завтра — уже да, разложим без ответа",
+          step_id in [r["id"] for r in await db.overdue_bundle_steps(tomorrow)])
+
+    await db.set_step_answer(step_id, "написал в среду сам")
+    check("её ответ сохранён",
+          await db.bundle_answers(bid) == ["написал в среду сам"])
+
+    # Порядок нерушим: следующий шаг не приедет, пока не закрыт предыдущий
+    check("второй шаг ждёт закрытия первого",
+          [r["step_no"] for r in await db.due_bundle_steps(far)] == [])
+    await db.complete_step(step_id, None)
+    check("после закрытия первого приезжает второй",
+          [r["step_no"] for r in await db.due_bundle_steps(far)] == [1])
+
+    # Занять шаг можно только один раз: долгая генерация не должна пересечься
+    # со следующим тиком рассылки и выдать один и тот же расклад дважды
+    second = (await db.due_bundle_steps(far))[0]["id"]
+    check("шаг занимается один раз", await db.claim_step(second) is True)
+    check("повторно занять нельзя", await db.claim_step(second) is False)
+    await db.release_step(second)
+    check("сорванный шаг возвращается в очередь",
+          await db.claim_step(second) is True)
+
+    # Повторяющаяся карта — то, ради чего пишется финальное письмо
+    await db.add_reading(1, "Он и я — шаг", "q",
+                         [{"id": 5, "name": "Луна", "rev": False},
+                          {"id": 6, "name": "Башня", "rev": False}], "текст", bid)
+    check("повторяющаяся карта находится",
+          "Луна" in (await db.bundle_repeat_card(bid) or ""))
+    await _mk_user(2)
+    empty = await db.create_bundle(2, "month")
+    check("без повторов возвращается None",
+          await db.bundle_repeat_card(empty) is None)
+
+    await db.finish_bundle(bid)
+    check("доигранный бандл больше не открыт",
+          not [r for r in await db.open_bundles(1, "him")])
+    check("и его шаги больше не приезжают",
+          not [r for r in await db.due_bundle_steps(far) if r["bundle_id"] == bid])
+
+
+async def test_bundle_stats() -> None:
+    print("\n[бандлы в /stats]")
+    await _fresh_db()
+    await _mk_user(1)
+    await db.create_bundle(1, "him")
+    b2 = await db.create_bundle(1, "month")
+    await db.finish_bundle(b2)
+    s = await db.stats_snapshot()
+    check("статистика считает бандлы",
+          s["b_total"] == 2 and s["b_new"] == 1 and s["b_done"] == 1)
+    check("экран статистики собирается",
+          "{" not in texts.ADMIN_STATS.format(
+              users=1, users_24h=0, users_7d=0, readings=0, readings_24h=0,
+              pay_count=0, rub=0.0, stars=0, subs=0, daily=0, daily_off=0,
+              rate_up=0, rate_down=0, sources="—",
+              b_total=s["b_total"], b_new=s["b_new"],
+              b_active=s["b_active"], b_done=s["b_done"]))
+
+
 async def main() -> None:
     test_texts()
     test_celtic()
@@ -560,6 +897,14 @@ async def main() -> None:
     await test_daily_personal()
     await test_daily_default()
     await test_mood_images()
+    test_ladder()
+    test_dialogue_tiers()
+    test_bundle_config()
+    test_bundle_prompts()
+    test_bundle_serial()
+    await test_purchases()
+    await test_bundle_flow()
+    await test_bundle_stats()
     print(f"\nИтого: ok {OK}, fail {FAIL}")
     if os.path.exists(DB_FILE):
         os.remove(DB_FILE)

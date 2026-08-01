@@ -36,21 +36,83 @@ YOOKASSA_SHOP_ID: str = os.getenv("YOOKASSA_SHOP_ID", "").strip()
 YOOKASSA_SECRET_KEY: str = os.getenv("YOOKASSA_SECRET_KEY", "").strip()
 
 # --- Цены ---
-PRICE_SINGLE_RUB: int = _int("PRICE_SINGLE_RUB", 79)
-PRICE_WEEK_RUB: int = _int("PRICE_WEEK_RUB", 249)
-PRICE_MONTH_RUB: int = _int("PRICE_MONTH_RUB", 599)
-STARS_SINGLE: int = _int("STARS_SINGLE", 56)
-STARS_WEEK: int = _int("STARS_WEEK", 175)
-STARS_MONTH: int = _int("STARS_MONTH", 420)
+# Лестница из четырёх ступеней: попробовать → набрать остаток →
+# разобрать свою историю до конца → жить в боте.
+#
+# Почему так, а не «подписка + разовый»:
+#   · остаток купленных раскладов сам по себе повод вернуться, а исчерпанный
+#     бесплатный лимит — повод уйти. Возврат у нас узкое место, не цена;
+#   · у пакета расход растёт ровно вместе с продажей — исчезает хвост
+#     безлимитного диалога, из-за которого месяц нельзя было опускать;
+#   · пакет можно продавать в момент подтверждённой ценности (кнопка «Попало»),
+#     а подписку в этот момент просить рано.
+#
+# Недельный тариф убран: при месяце в 299 ₽ он не отличим от пакета и путает
+# витрину. Старые платежи с plan='week' всё равно обрабатываются — см. LEGACY_PLANS.
+PRICE_SINGLE_RUB: int = _int("PRICE_SINGLE_RUB", 49)
+PRICE_PACK_RUB: int = _int("PRICE_PACK_RUB", 149)
+PRICE_BUNDLE_RUB: int = _int("PRICE_BUNDLE_RUB", 249)
+PRICE_MONTH_RUB: int = _int("PRICE_MONTH_RUB", 299)
 
-# Единый справочник тарифов. days: None = разовый расклад.
+# ⚠️ Звёзды пересчитаны в прежней пропорции (≈1,41 ₽ за звезду) — то есть
+# паритет со звёздами по-прежнему НЕ решён, см. «Открытые вопросы» в
+# МОНЕТИЗАЦИЯ.md. Со звёзд, купленных с телефона, доходит ~2/3 (30% Apple/Google
+# + комиссия Fragment), поэтому звёздный прайс должен быть выше рублёвого на
+# 30–40%. Поднимать только после того, как цену 70 ⭐ посмотрят глазами со
+# своего телефона: Telegram показывает её в локальной валюте.
+STARS_SINGLE: int = _int("STARS_SINGLE", 35)
+STARS_PACK: int = _int("STARS_PACK", 105)
+STARS_BUNDLE: int = _int("STARS_BUNDLE", 175)
+STARS_MONTH: int = _int("STARS_MONTH", 210)
+
+# Сколько раскладов даёт пакет
+PACK_READINGS: int = _int("PACK_READINGS", 5)
+
+# Единый справочник тарифов.
+#   kind: 'single' | 'pack' | 'bundle' | 'sub' — по нему apply_purchase решает,
+#         что начислить. days нужен только подпискам.
 # Названия видит человек в момент оплаты (счёт Telegram, ссылка ЮKassa) —
 # поэтому здесь не должно быть обещаний, которых мы не выполняем.
 PLANS: dict[str, dict] = {
-    "single": {"title": "1 расклад", "rub": PRICE_SINGLE_RUB, "stars": STARS_SINGLE, "days": None},
-    "week": {"title": "Подписка на неделю", "rub": PRICE_WEEK_RUB, "stars": STARS_WEEK, "days": 7},
-    "month": {"title": "Подписка на месяц", "rub": PRICE_MONTH_RUB, "stars": STARS_MONTH, "days": 30},
+    "single": {
+        "title": "1 расклад", "rub": PRICE_SINGLE_RUB, "stars": STARS_SINGLE,
+        "days": None, "kind": "single",
+    },
+    "pack5": {
+        "title": f"{PACK_READINGS} раскладов", "rub": PRICE_PACK_RUB,
+        "stars": STARS_PACK, "days": None, "kind": "pack",
+        "readings": PACK_READINGS,
+    },
+    "bundle_him": {
+        "title": "«Он и я» — разбор на две недели", "rub": PRICE_BUNDLE_RUB,
+        "stars": STARS_BUNDLE, "days": None, "kind": "bundle", "bundle": "him",
+    },
+    "bundle_month": {
+        "title": "«Месяц вперёд» — разбор на месяц", "rub": PRICE_BUNDLE_RUB,
+        "stars": STARS_BUNDLE, "days": None, "kind": "bundle", "bundle": "month",
+    },
+    "month": {
+        "title": "Подписка на месяц", "rub": PRICE_MONTH_RUB,
+        "stars": STARS_MONTH, "days": 30, "kind": "sub",
+    },
 }
+
+# Тарифы, которые сняты с продажи, но могли остаться в незакрытых платежах.
+# Человек мог получить ссылку на оплату до обновления и нажать «Я оплатила»
+# уже после — деньги списаны, и мы обязаны их отработать по старым условиям.
+LEGACY_PLANS: dict[str, dict] = {
+    "week": {"title": "Подписка на неделю", "rub": 249, "stars": 175,
+             "days": 7, "kind": "sub"},
+}
+
+
+def plan(plan_key: str) -> dict | None:
+    """Тариф по ключу, включая снятые с продажи."""
+    return PLANS.get(plan_key) or LEGACY_PLANS.get(plan_key)
+
+
+# Порядок ступеней на витрине «💳 Тарифы» — снизу вверх по чеку
+LADDER: tuple[str, ...] = ("single", "pack5", "bundle_him", "bundle_month", "month")
 
 # --- Логика продукта ---
 # Сколько бесплатных раскладов даём на входе (одноразовый стартовый запас).
@@ -69,18 +131,25 @@ TOPUP_HOUR: int = _int("TOPUP_HOUR", 11)
 TOPUP_NOTIFY_DAYS: int = _int("TOPUP_NOTIFY_DAYS", 30)
 
 # --- Лимиты разговора после расклада ---
-DIALOGUE_MAX: int = _int("DIALOGUE_MAX", 5)           # без подписки — на расклад
-# С подпиской — потолок в сутки. Смысл не в экономии на клиенте, а в том, чтобы
-# у нас не было статьи расходов без потолка: реплика стоит ~1 ₽, и без лимита
-# один человек, который говорит целыми днями, съедает всю выручку месяца.
-# 20 в сутки — это в 4 раза больше бесплатного и заведомо больше, чем нужно
-# в живом разговоре. Двигать только по /stats, когда будут живые цифры.
-DIALOGUE_MAX_SUB: int = _int("DIALOGUE_MAX_SUB", 20)  # с подпиской — в сутки
-# И месячный бюджет реплик. Суточный потолок нужен, чтобы вечер разговора был
-# длинным (20 — это много), а месячный — чтобы 30 таких вечеров подряд не съели
-# всю выручку. 300 в месяц = в среднем 10 в день; живой человек столько не
-# наговорит, а патологический случай теперь конечен. 0 = выключить.
-DIALOGUE_MAX_SUB_MONTH: int = _int("DIALOGUE_MAX_SUB_MONTH", 300)
+# Реплика стоит ≈1 ₽ — это единственная статья, способная съесть выручку.
+# Поэтому лимит привязан не к человеку, а к тому, ЧЕМ оплачен расклад:
+# бесплатный — затравка, платный — заметно длиннее, бандл — длинный разговор
+# и есть сам продукт.
+DIALOGUE_MAX: int = _int("DIALOGUE_MAX", 5)                    # бесплатный расклад
+DIALOGUE_MAX_PAID: int = _int("DIALOGUE_MAX_PAID", 10)         # разовый и пакет
+DIALOGUE_MAX_BUNDLE: int = _int("DIALOGUE_MAX_BUNDLE", 25)     # бандл, день 0
+DIALOGUE_MAX_BUNDLE_STEP: int = _int("DIALOGUE_MAX_BUNDLE_STEP", 10)  # шаги бандла
+
+# С подпиской — потолок в сутки и бюджет на месяц. Смысл не в экономии на
+# клиенте, а в том, чтобы у нас не было статьи расходов без потолка.
+#
+# ⚠️ Цифры уменьшены вместе с ценой месяца (599 → 299 ₽). Раньше потолок
+# расходов в 300 реплик ещё оставлял маржу; при 299 ₽ он съедает выручку
+# целиком. 120 реплик (≈120 ₽) плюс ~60 ₽ раскладов держат ту же структуру
+# маржи, что была. На практике в эти лимиты не упирался никто — это защита
+# от хвоста, а не нормальный опыт. Двигать по /stats. 0 = выключить.
+DIALOGUE_MAX_SUB: int = _int("DIALOGUE_MAX_SUB", 15)           # с подпиской — в сутки
+DIALOGUE_MAX_SUB_MONTH: int = _int("DIALOGUE_MAX_SUB_MONTH", 120)
 
 # --- Что входит в подписку ---
 # Расклады только для подписчиц (ключи из texts.SPREAD_TITLES).
@@ -146,6 +215,53 @@ def mood_img_url(index: int) -> str:
     if not MOOD_IMG_BASE or MOOD_COUNT <= 0:
         return ""
     return MOOD_IMG_BASE.rstrip("/") + f"/mood_{index % MOOD_COUNT + 1:02d}.jpg"
+
+
+# --- Картинки экранов продажи ---
+# Горизонтальные (3:2) картинки под ступени лестницы: offer_pack.jpg,
+# offer_him.jpg, offer_month.jpg, offer_sub.jpg в репозитории миниаппа.
+# Товар за 249 ₽ невидим — картинка делает обещание вещью, а сообщение с фото
+# занимает пол-экрана и останавливает пролистывание. Цену на картинку НЕ
+# наносим: цены мы меняем, а перерисовывать нельзя.
+# Пусто — экраны продажи уходят текстом, как раньше.
+OFFER_IMG_BASE: str = os.getenv(
+    "OFFER_IMG_BASE", "https://gidks.github.io/karty-miniapp/").strip()
+
+
+def offer_img_url(name: str) -> str:
+    """URL картинки экрана продажи ('pack', 'him', 'month', 'sub') или ''."""
+    if not OFFER_IMG_BASE or not name:
+        return ""
+    return OFFER_IMG_BASE.rstrip("/") + f"/offer_{name}.jpg"
+
+
+# --- Бандлы: тематические разборы с расписанием ---
+# Бандл — не «N раскладов со скидкой», а одна ситуация, доведённая до конца:
+# расклады внутри связаны, знают друг друга и приходят по расписанию.
+# Главное, ради чего он существует: бот получает законный повод написать
+# первым на 3-й и 7-й день — то есть бандл встроенно чинит возврат.
+#
+# 1 = продавать, 0 = скрыть с витрины (уже купленные доигрываются).
+BUNDLES_ENABLED: int = _int("BUNDLES_ENABLED", 1)
+
+# Дни шагов, через запятую, от дня покупки. Числа подобранные, не священные:
+# три дня — достаточно, чтобы что-то успело произойти, и мало, чтобы она
+# остыла. Правим по факту, код не трогаем.
+BUNDLE_HIM_DAYS: str = os.getenv("BUNDLE_HIM_DAYS", "3,7,14").strip()
+BUNDLE_MONTH_DAYS: str = os.getenv("BUNDLE_MONTH_DAYS", "7,14,21,28,30").strip()
+
+# Сколько бандлов одного вида можно вести одновременно (1 = только один)
+BUNDLE_MAX_ACTIVE: int = _int("BUNDLE_MAX_ACTIVE", 1)
+
+
+def bundle_days(raw: str, fallback: list[int]) -> list[int]:
+    """«3,7,14» -> [3, 7, 14]. Кривая строка -> значения по умолчанию."""
+    try:
+        days = [int(x) for x in raw.replace(" ", "").split(",") if x]
+    except ValueError:
+        return list(fallback)
+    days = sorted({d for d in days if d > 0})
+    return days or list(fallback)
 
 
 def validate() -> None:

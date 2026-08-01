@@ -21,9 +21,12 @@ from aiogram.types import (
     ReplyKeyboardRemove,
 )
 
+import bundle_run
+import bundles
 import cards
 import config
 import database as db
+import delivery
 import keyboards as kb
 import llm
 import payments
@@ -51,9 +54,21 @@ class Reading(StatesGroup):
     in_dialogue = State()
 
 
+class BundleIntro(StatesGroup):
+    """Три вопроса на входе в бандл. Не для гадания — для того, чтобы текст
+    не был общим и чтобы в финальном письме было с чем сравнить."""
+    waiting_answer = State()
+
+
 class AdminCast(StatesGroup):
     waiting_message = State()
     confirming = State()
+
+
+# Движок бандлов ставит разговор после расклада и из фоновых задач —
+# ему нужны наше состояние диалога и хранилище FSM (второе прокидывается
+# из bot.py при старте).
+bundle_run.bind(None, Reading.in_dialogue)
 
 
 # ---------- Хелперы ----------
@@ -89,19 +104,35 @@ def _today_msk() -> str:
     return datetime.now(ZoneInfo(config.TIMEZONE)).strftime("%Y-%m-%d")
 
 
+def _menu_title(row) -> str:
+    """Заголовок меню с остатком. Остаток на виду — причина вернуться;
+    пустой баланс молчит, чтобы не тыкать носом."""
+    if row is None:
+        return texts.MENU_TITLE
+    left = texts.balance_short(
+        row["free_readings_left"], row["paid_readings_left"],
+        _msk(row["subscription_until"]),
+    )
+    return texts.MENU_TITLE + (f"\n<i>{left}</i>" if left else "")
+
+
 async def _show_menu(message: Message, text: str | None = None) -> None:
-    await message.answer(text or texts.MENU_TITLE, reply_markup=kb.main_menu())
+    row = await db.get_user(message.from_user.id)
+    await message.answer(text or _menu_title(row), reply_markup=kb.main_menu())
 
 
 def _paywall_text(row) -> str:
-    """Пейволл: обещание недельного пополнения, цены и витрина подписки."""
+    """Пейволл. Продаём пакет, а не подписку: человек сделал два-три расклада
+    и к месячному обязательству не готов, зато купленный остаток сам по себе
+    станет поводом вернуться."""
     return texts.PAYWALL.format(
         name=esc(_display_name(row)),
         topup=texts.topup_promise(),
+        pack_n=config.PACK_READINGS,
+        p_pack=config.PRICE_PACK_RUB,
         p_single=config.PRICE_SINGLE_RUB,
-        p_week=config.PRICE_WEEK_RUB,
-        p_month=config.PRICE_MONTH_RUB,
-        benefits=texts.sub_benefits(),
+        d_paid=config.DIALOGUE_MAX_PAID,
+        d_free=config.DIALOGUE_MAX,
     )
 
 
@@ -122,34 +153,10 @@ def _past_block(rows) -> str | None:
     return "\n".join(items) if items else None
 
 
-async def _typing_while(bot: Bot, chat_id: int, coro):
-    """Держит индикатор «печатает…», пока крутится долгая корутина (генерация LLM)."""
-    task = asyncio.create_task(coro)
-    try:
-        while True:
-            try:
-                await bot.send_chat_action(chat_id, "typing")
-            except Exception:  # noqa: BLE001 — индикатор не критичен
-                pass
-            done, _ = await asyncio.wait({task}, timeout=4)
-            if done:
-                break
-    finally:
-        if not task.done():
-            task.cancel()
-    return task.result()
-
-
-async def _send_card_photo(bot: Bot, chat_id: int, card_id: int) -> None:
-    """Шлёт картинку карты в чат. Если картинки отключены или URL не отдался —
-    молча пропускаем, текст придёт в любом случае."""
-    url = config.card_img_url(card_id)
-    if not url:
-        return
-    try:
-        await bot.send_photo(chat_id, url)
-    except Exception:  # noqa: BLE001 — картинка не критична, текст важнее
-        pass
+# Обе вынесены в delivery: ими пользуется и планировщик, когда сам присылает
+# очередной шаг бандла. Здесь — псевдонимы, чтобы не переписывать вызовы.
+_typing_while = delivery.typing_while
+_send_card_photo = delivery.send_card_photo
 
 
 async def _ensure_user(message: Message) -> object | None:
@@ -276,6 +283,8 @@ async def cmd_stats(message: Message) -> None:
         pay_count=s["pay_count"], rub=s["rub"], stars=s["stars"],
         subs=s["subs"], daily=s["daily"], daily_off=s["daily_off"], sources=sources,
         rate_up=s["rate_up"], rate_down=s["rate_down"],
+        b_total=s["b_total"], b_new=s["b_new"],
+        b_active=s["b_active"], b_done=s["b_done"],
     ))
 
 
@@ -287,6 +296,17 @@ async def cmd_broadcast(message: Message, state: FSMContext) -> None:
 
 # ---------- Расклад: выбор темы и вопрос ----------
 
+async def _spreads_kb(uid: int, row) -> object:
+    """Меню раскладов с бандлами. Бандл здесь, а не в «Тарифах», потому что
+    «хочу разобраться с ним» — это выбор расклада, а не решение купить."""
+    open_ids = {b["kind"] for b in await db.open_bundles(uid)}
+    return kb.spreads(
+        bool(row and db.sub_active(row)),
+        bundle_keys=bundles.on_sale(),
+        active=open_ids,
+    )
+
+
 @router.callback_query(F.data == "new_reading")
 async def cb_new_reading(call: CallbackQuery, state: FSMContext) -> None:
     await _ack(call)
@@ -295,12 +315,15 @@ async def cb_new_reading(call: CallbackQuery, state: FSMContext) -> None:
     row = await db.get_user(uid)
     ok, _src = await db.readings_available(uid)
     if not ok:
-        await call.message.answer(_paywall_text(row), reply_markup=kb.plans())
+        # Бандлы всё равно показываем: у них своя оплата, и человек, упёршийся
+        # в лимит, — как раз тот, кому уместно предложить разбор целиком.
+        await call.message.answer(_paywall_text(row), reply_markup=kb.pack_offer())
+        if bundles.on_sale():
+            await call.message.answer(
+                texts.SPREAD_MENU, reply_markup=await _spreads_kb(uid, row))
         return
     await call.message.answer(
-        texts.SPREAD_MENU,
-        reply_markup=kb.spreads(bool(row and db.sub_active(row))),
-    )
+        texts.SPREAD_MENU, reply_markup=await _spreads_kb(uid, row))
 
 
 @router.callback_query(F.data.startswith("spread:"))
@@ -321,7 +344,7 @@ async def cb_spread(call: CallbackQuery, state: FSMContext) -> None:
             await call.message.answer(
                 texts.CELTIC_LOCKED.format(
                     benefits=texts.sub_benefits(skip="celtic"),
-                    p_week=config.PRICE_WEEK_RUB, p_month=config.PRICE_MONTH_RUB,
+                    p_month=config.PRICE_MONTH_RUB,
                 ),
                 reply_markup=kb.sub_plans(),
             )
@@ -344,26 +367,25 @@ async def cb_topic(call: CallbackQuery, state: FSMContext) -> None:
     await call.message.answer(texts.ASK_QUESTION[topic_key])
 
 
-# Сколько карт тянется в каждом раскладе (по умолчанию 3)
-SPREAD_CARDS: dict[str, int] = {"yesno": 1, "week": 7, "celtic": 10}
+# Справочники переехали в prompts, чтобы расклады бандлов и обычные
+# не расходились между собой
+SPREAD_CARDS = prompts.SPREAD_CARD_COUNT
+SPREAD_MAX_TOKENS = prompts.SPREAD_MAX_TOKENS
 
 # Расклады, которые Mini App пока не умеет (в колоде приложения слотов до 7):
 # для них карты тянет бот сам, чтобы не было расхождения «выбрала одно —
 # пришло другое».
-NO_APP_SPREADS: set[str] = {"celtic"}
+NO_APP_SPREADS: set[str] = {"celtic", "month6"}
 
-# Потолок длины ответа модели по типу расклада
-SPREAD_MAX_TOKENS: dict[str, int] = {
-    "yesno": 500, "week": 1800, "celtic": 2600,
-}
+_spread_n = prompts.card_count
+_max_tokens = prompts.max_tokens
 
 
-def _spread_n(spread: str) -> int:
-    return SPREAD_CARDS.get(spread, 3)
-
-
-def _max_tokens(spread: str) -> int:
-    return SPREAD_MAX_TOKENS.get(spread, 1300)
+def _dialogue_limit(source: str) -> int:
+    """Сколько реплик даёт расклад. Лимит привязан не к человеку, а к тому,
+    чем расклад оплачен: реплика стоит ≈1 ₽, и это единственная статья,
+    способная съесть выручку."""
+    return config.DIALOGUE_MAX_PAID if source == "paid" else config.DIALOGUE_MAX
 
 
 def _parse_webapp_payload(raw: str, spread: str) -> tuple[list[dict], str, str | None] | None:
@@ -466,7 +488,7 @@ async def _check_readings_available(message: Message, state: FSMContext) -> bool
         return True
     await state.clear()
     row = await db.get_user(message.from_user.id)
-    await message.answer(_paywall_text(row), reply_markup=kb.plans())
+    await message.answer(_paywall_text(row), reply_markup=kb.pack_offer())
     return False
 
 
@@ -474,55 +496,9 @@ async def _deliver_serial(
     message: Message, bot: Bot, spread: str, drawn: list[dict],
     labels: list[str] | None, parsed: dict, reading_id: int,
 ) -> None:
-    """Серийная подача: карта за картой с паузами «печатает…», затем итог.
-    Подсказки-реплики вешаются reply-клавиатурой на последнее карточное
-    сообщение (inline-кнопки итога их не перебивают — это разные клавиатуры)."""
-    chat_id = message.chat.id
-    chips_kb = kb.chips_reply(parsed["chips"]) if parsed["chips"] else None
-
-    async def pause(sec: float) -> None:
-        try:
-            await bot.send_chat_action(chat_id, "typing")
-        except Exception:  # noqa: BLE001 — индикатор не критичен
-            pass
-        await asyncio.sleep(sec)
-
-    if spread == "week":
-        if parsed["intro"]:
-            await message.answer(texts.WEEK_INTRO_MSG.format(body=esc(parsed["intro"])))
-        groups = [(0, 3), (3, 5), (5, 7)]
-        for gi, (lo, hi) in enumerate(groups):
-            await pause(1.1)
-            blocks = [
-                texts.week_day_html(
-                    labels[i] if labels and i < len(labels) else f"День {i + 1}",
-                    drawn[i], parsed["cards"][i])
-                for i in range(lo, hi)
-            ]
-            await message.answer(
-                "\n\n".join(blocks),
-                reply_markup=chips_kb if gi == len(groups) - 1 else None)
-    else:
-        n = len(parsed["cards"])
-        # Много карт (Кельтский крест) — темп бодрее, иначе разбор растянется
-        step = 0.9 if n >= 8 else 1.4
-        for i, body in enumerate(parsed["cards"]):
-            await pause(step if i else 0.6)
-            label = labels[i] if labels and i < len(labels) else None
-            await message.answer(
-                texts.card_message_html(drawn[i], label, body, with_ref=True),
-                reply_markup=chips_kb if i == n - 1 else None)
-
-    await pause(1.0)
-    tail = texts.AFTER_READING_SERIAL if parsed["chips"] else texts.AFTER_READING
-    if parsed["summary"]:
-        await message.answer(
-            texts.SUMMARY_MSG.format(body=esc(parsed["summary"])) + tail,
-            reply_markup=kb.after_reading(reading_id))
-    else:
-        invite = (texts.SERIAL_INVITE if parsed["chips"]
-                  else texts.AFTER_READING.lstrip("\n"))
-        await message.answer(invite, reply_markup=kb.after_reading(reading_id))
+    """Серийная подача — теперь общая с планировщиком, см. delivery.send_serial."""
+    await delivery.send_serial(
+        bot, message.chat.id, spread, drawn, labels, parsed, reading_id)
 
 
 def _week_serial_rows(drawn: list[dict], labels: list[str] | None,
@@ -636,6 +612,10 @@ async def _do_reading(
             topic=topic_title, question=question,
             drawn=[{"id": c["id"], "name": c["name"], "rev": c["rev"]} for c in drawn],
             reading_text=clean_text, history=[], rounds=0,
+            # Длина разговора решается здесь: платный расклад должен
+            # ощущаться иначе бесплатного, иначе платить не за что
+            dlg_max=_dialogue_limit(source), dlg_locked=False, bundle_id=None,
+            spread=spread,
         )
 
         # Реферальный бонус — после первого расклада приглашённой
@@ -652,6 +632,25 @@ async def _do_reading(
 
 # ---------- Диалог после расклада ----------
 
+def _dialogue_limit_text(data: dict, dlg_max: int) -> str:
+    """Что сказать, когда реплики кончились. Внутри бандла ничего не продаём:
+    она уже заплатила, и допродажа здесь читалась бы как обман."""
+    if data.get("bundle_id"):
+        return texts.DIALOGUE_LIMIT
+    return texts.DIALOGUE_LIMIT_OFFER.format(
+        free=dlg_max,
+        p_single=config.PRICE_SINGLE_RUB,
+        d_paid=config.DIALOGUE_MAX_PAID,
+        next_free=texts.next_topup_phrase() if texts.topup_enabled() else "скоро",
+    )
+
+
+def _dialogue_tail_kb(data: dict):
+    if data.get("bundle_id"):
+        return kb.after_reading()
+    return kb.continue_offer()
+
+
 @router.message(Reading.in_dialogue, F.text, ~F.text.startswith("/"))
 async def dialogue(message: Message, state: FSMContext, bot: Bot) -> None:
     uid = message.from_user.id
@@ -665,14 +664,20 @@ async def dialogue(message: Message, state: FSMContext, bot: Bot) -> None:
     is_sub = bool(row and db.sub_active(row))
 
     if not is_sub:
-        # Без подписки — лимит реплик на один расклад
-        if rounds > config.DIALOGUE_MAX:
-            await state.clear()
-            await message.answer(
-                texts.DIALOGUE_LIMIT.format(
-                    sub=config.DIALOGUE_MAX_SUB, free=config.DIALOGUE_MAX),
-                reply_markup=kb.after_reading(),
-            )
+        # Без подписки — лимит реплик на один расклад. Сколько именно, решил
+        # тариф, которым расклад оплачен (см. _dialogue_limit).
+        dlg_max = int(data.get("dlg_max") or config.DIALOGUE_MAX)
+        if data.get("dlg_locked"):
+            await message.answer(texts.DIALOGUE_LOCKED,
+                                 reply_markup=_dialogue_tail_kb(data))
+            return
+        if rounds > dlg_max:
+            # Состояние НЕ чистим: покупка должна уметь продлить именно этот
+            # разговор, а не начать новый. Она в середине беседы — это самая
+            # импульсная точка продажи, которая у нас есть.
+            await state.update_data(dlg_locked=True)
+            await message.answer(_dialogue_limit_text(data, dlg_max),
+                                 reply_markup=_dialogue_tail_kb(data))
             return
     elif config.DIALOGUE_MAX_SUB > 0 or config.DIALOGUE_MAX_SUB_MONTH > 0:
         # У подписчиц разговор длинный, но не бесконечный: потолок в сутки
@@ -853,6 +858,54 @@ async def cb_collection(call: CallbackQuery) -> None:
 
 # ---------- Оценка расклада ----------
 
+# Какой бандл предлагать — не гадаем: это говорит сам расклад, который она
+# выбрала. Ключи — то, что лежит в readings.topic.
+_TOPIC_TO_BUNDLE: dict[str, str] = {
+    "Что он чувствует": "him",
+    "Отношения": "him",
+    "Неделя вперёд": "month",
+}
+
+
+async def _offer_after_rate(call: CallbackQuery, reading_id: int) -> None:
+    """Оффер на кнопку «Попало» — единственная точка, где уместен большой чек:
+    она только что сама подтвердила, что попало."""
+    uid = call.from_user.id
+    row = await db.get_user(uid)
+    if row is None or db.sub_active(row):
+        return                                  # подписчице продавать нечего
+    if await db.open_bundles(uid):
+        return                                  # разбор уже идёт — не мешаем
+
+    reading = await db.get_reading(reading_id)
+    if reading is not None and reading["bundle_id"]:
+        return                                  # это расклад внутри бандла
+
+    topic = (reading["topic"] if reading else "") or ""
+    key = _TOPIC_TO_BUNDLE.get(topic.strip())
+    if key and key in bundles.on_sale():
+        b = bundles.get(key)
+        await delivery.send_offer(
+            call.bot, call.message.chat.id, b["img"],
+            texts.OFFER_ON_RATE_BUNDLE.format(
+                about=texts.BUNDLE_ABOUT[key], price=config.PRICE_BUNDLE_RUB),
+            kb.bundle_offer(key, back="menu"),
+        )
+        return
+
+    # Пакет предлагаем только тому, у кого запас на исходе: человеку с полным
+    # балансом это просто мешает
+    left = (row["free_readings_left"] or 0) + (row["paid_readings_left"] or 0)
+    if left <= 1:
+        await delivery.send_offer(
+            call.bot, call.message.chat.id, "pack",
+            texts.OFFER_ON_RATE_PACK.format(
+                pack_n=config.PACK_READINGS, p_pack=config.PRICE_PACK_RUB,
+                per=config.PRICE_PACK_RUB // max(config.PACK_READINGS, 1)),
+            kb.pack_offer(),
+        )
+
+
 @router.callback_query(F.data.startswith("rate:"))
 async def cb_rate(call: CallbackQuery) -> None:
     parts = call.data.split(":")
@@ -860,13 +913,19 @@ async def cb_rate(call: CallbackQuery) -> None:
         await _ack(call)
         return
     value = 1 if parts[2] == "up" else -1
-    await db.set_reading_rating(int(parts[1]), call.from_user.id, value)
+    reading_id = int(parts[1])
+    await db.set_reading_rating(reading_id, call.from_user.id, value)
     await _ack(call, texts.RATE_THANKS_UP if value == 1 else texts.RATE_THANKS_DOWN)
     try:
         # Убираем кнопки оценки, оставляем «Новый расклад / В меню»
         await call.message.edit_reply_markup(reply_markup=kb.after_reading())
     except Exception:  # noqa: BLE001 — сообщение могло устареть
         pass
+    if value == 1:
+        try:
+            await _offer_after_rate(call, reading_id)
+        except Exception as e:  # noqa: BLE001 — оффер не важнее спасибо
+            log.warning("оффер после 👍 не ушёл: %s", e)
 
 
 # ---------- Мои расклады ----------
@@ -963,7 +1022,7 @@ async def cb_review(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         await call.message.answer(
             texts.REVIEW_LOCKED.format(
                 benefits=texts.sub_benefits(skip="review"),
-                p_week=config.PRICE_WEEK_RUB, p_month=config.PRICE_MONTH_RUB,
+                p_month=config.PRICE_MONTH_RUB,
             ),
             reply_markup=kb.sub_plans(back="menu"),
         )
@@ -1018,6 +1077,150 @@ async def cb_review(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
         BUSY.discard(uid)
 
 
+# ---------- Бандлы ----------
+
+# Явный отказ отвечать. «Не знаю» и «ничего» сюда НЕ входят: это осмысленные
+# ответы, мы сами их в вопросах и предлагаем.
+_SKIP_WORDS = {"пропустим", "пропусти", "пропустить", "пропуск", "skip", "-", "—", "–"}
+
+
+@router.callback_query(F.data.startswith("bundle:show:"))
+async def cb_bundle_show(call: CallbackQuery, state: FSMContext) -> None:
+    """Экран объяснения. Ответ на «за что такая цена» — само расписание,
+    днями: видно, что покупаешь две недели, а не один расклад."""
+    await _ack(call)
+    key = call.data.split(":", 2)[2]
+    b = bundles.get(key)
+    if not b or key not in bundles.on_sale():
+        return
+    open_rows = await db.open_bundles(call.from_user.id, key)
+    if open_rows:
+        row = open_rows[0]
+        if row["status"] == "new":
+            # Оплачен, но так и не начат — не продаём второй раз, а зовём начать
+            await call.message.answer(
+                texts.BUNDLE_START_LEAD.get(key, ""),
+                reply_markup=kb.bundle_start(row["id"]))
+        else:
+            await call.message.answer(texts.BUNDLE_ALREADY, reply_markup=kb.to_menu())
+        return
+    await delivery.send_offer(
+        call.bot, call.message.chat.id, b["img"],
+        texts.BUNDLE_OFFER.format(
+            about=texts.BUNDLE_ABOUT[key], price=config.PRICE_BUNDLE_RUB),
+        kb.bundle_offer(key),
+    )
+
+
+@router.callback_query(F.data.startswith("bundle:start:"))
+async def cb_bundle_start(call: CallbackQuery, state: FSMContext) -> None:
+    await _ack(call)
+    raw = call.data.split(":", 2)[2]
+    if not raw.isdigit():
+        return
+    row = await db.get_bundle(int(raw))
+    if row is None or row["user_id"] != call.from_user.id:
+        return
+    if row["status"] != "new":
+        await call.message.answer(texts.BUNDLE_ALREADY, reply_markup=kb.to_menu())
+        return
+    key = row["kind"]
+    questions = bundles.intro_questions(key)
+    if not questions:
+        return
+    await state.set_state(BundleIntro.waiting_answer)
+    await state.update_data(bundle_id=row["id"], b_key=key, b_idx=0, b_answers={})
+    await call.message.answer(texts.BUNDLE_START_LEAD.get(key, ""))
+    await call.message.answer(_bundle_question(key, 0))
+
+
+def _bundle_question(key: str, idx: int) -> str:
+    q = bundles.intro_questions(key)[idx]
+    return texts.BUNDLE_Q.format(
+        n=idx + 1, total=len(bundles.intro_questions(key)),
+        q=q["q"], skip=q["skip"])
+
+
+@router.message(BundleIntro.waiting_answer, F.text, ~F.text.startswith("/"))
+async def bundle_intro_answer(message: Message, state: FSMContext, bot: Bot) -> None:
+    data = await state.get_data()
+    key = data.get("b_key") or ""
+    idx = int(data.get("b_idx") or 0)
+    questions = bundles.intro_questions(key)
+    if not questions:
+        await state.clear()
+        return
+
+    answers = dict(data.get("b_answers") or {})
+    text = (message.text or "").strip()[:400]
+    if text.lower().strip(".!") not in _SKIP_WORDS:
+        answers[questions[idx]["label"]] = text
+
+    idx += 1
+    if idx < len(questions):
+        await state.update_data(b_idx=idx, b_answers=answers)
+        await message.answer(_bundle_question(key, idx))
+        return
+
+    # Вопросы кончились — раскладываем день 0
+    uid = message.from_user.id
+    if uid in BUSY:
+        await message.answer(texts.BUSY)
+        return
+    row = await db.get_bundle(int(data.get("bundle_id") or 0))
+    if row is None or row["user_id"] != uid or row["status"] != "new":
+        await state.clear()
+        await _show_menu(message)
+        return
+
+    await state.clear()
+    await message.answer(texts.BUNDLE_INTRO_DONE, reply_markup=ReplyKeyboardRemove())
+    BUSY.add(uid)
+    try:
+        await bundle_run.deliver_day0(
+            bot, message.chat.id, uid, row, answers, _display_name(await db.get_user(uid)),
+            state=state,
+        )
+    finally:
+        BUSY.discard(uid)
+
+
+@router.callback_query(F.data.startswith("bundle:go:"))
+async def cb_bundle_go(call: CallbackQuery, state: FSMContext, bot: Bot) -> None:
+    """«Просто разложи» — она не хочет рассказывать. Это нормальный путь,
+    а не отказ: расклад не должен зависеть от её ответа."""
+    await _ack(call)
+    raw = call.data.split(":", 2)[2]
+    if not raw.isdigit():
+        return
+    await _run_bundle_step(call.bot, call.from_user.id, call.message.chat.id,
+                           int(raw), None, state)
+
+
+async def _run_bundle_step(
+    bot: Bot, uid: int, chat_id: int, step_id: int,
+    answer: str | None, state: FSMContext | None,
+) -> bool:
+    step = await db.get_bundle_step(step_id)
+    if step is None or step["user_id"] != uid or step["done"]:
+        return False
+    if uid in BUSY:
+        await bot.send_message(chat_id, texts.BUSY)
+        return False
+    BUSY.add(uid)
+    try:
+        if answer:
+            await bot.send_message(chat_id, texts.BUNDLE_STEP_WAIT)
+        if state is not None:
+            await state.clear()
+        return await bundle_run.run_step(bot, chat_id, uid, step, answer, state)
+    except Exception as e:  # noqa: BLE001 — шаг не должен ронять бота
+        log.error("шаг бандла %s не выдан: %s", step_id, e)
+        return False
+    finally:
+        BUSY.discard(uid)
+
+
 # ---------- Реферальная ссылка ----------
 
 @router.callback_query(F.data == "share")
@@ -1043,8 +1246,7 @@ async def cb_tariffs(call: CallbackQuery) -> None:
     )
     await call.message.answer(
         texts.TARIFFS.format(
-            p_single=config.PRICE_SINGLE_RUB, p_week=config.PRICE_WEEK_RUB,
-            p_month=config.PRICE_MONTH_RUB, left=left,
+            ladder=texts.ladder_lines(), left=left,
             benefits=texts.sub_benefits(), free_note=texts.free_note(),
         ),
         reply_markup=kb.plans(),
@@ -1058,6 +1260,11 @@ async def cb_buy(call: CallbackQuery) -> None:
     plan = config.PLANS.get(plan_key)
     if not plan:
         return
+    # Второй бандл того же вида покупать незачем — сначала доиграем этот
+    if plan.get("kind") == "bundle":
+        if await db.open_bundles(call.from_user.id, plan["bundle"]):
+            await call.message.answer(texts.BUNDLE_ALREADY, reply_markup=kb.to_menu())
+            return
     await call.message.answer(
         texts.CHOOSE_PAY_METHOD.format(
             plan=plan["title"], price=f"{plan['rub']} ₽ / {plan['stars']} ⭐"),
@@ -1087,14 +1294,56 @@ async def pre_checkout(query: PreCheckoutQuery) -> None:
     await query.answer(ok=True)
 
 
+async def _after_purchase(
+    bot: Bot, chat_id: int, user_id: int, plan_key: str,
+    state: FSMContext | None,
+) -> None:
+    """Начисление и то, что человек видит следом.
+
+    Отдельной функцией, потому что путей оплаты два (звёзды и карта), и
+    расходиться они не должны: бандл после карты обязан начаться так же,
+    как после звёзд."""
+    bundle_id = await db.apply_purchase(user_id, plan_key)
+    plan = config.plan(plan_key) or {}
+    text = texts.pay_success(plan_key)
+
+    if bundle_id:
+        b = bundles.by_plan(plan_key)
+        await bot.send_message(chat_id, text, reply_markup=kb.bundle_start(bundle_id))
+        if b:
+            log.info("бандл %s куплен пользователем %s (id %s)",
+                     b["key"], user_id, bundle_id)
+        return
+
+    # Куплено посреди оборванного разговора — продлеваем именно его.
+    # Она платила, чтобы договорить, а не чтобы получить расклад «на потом»:
+    # расклад всё равно останется в остатке, но сначала вернём беседу.
+    unlocked = False
+    if state is not None and plan.get("kind") in ("single", "pack"):
+        data = await state.get_data()
+        if data.get("dlg_locked"):
+            await state.update_data(
+                dlg_locked=False,
+                dlg_max=int(data.get("dlg_max") or config.DIALOGUE_MAX)
+                + config.DIALOGUE_MAX_PAID,
+            )
+            unlocked = True
+
+    await bot.send_message(chat_id, text, reply_markup=kb.main_menu())
+    if unlocked:
+        await bot.send_message(
+            chat_id,
+            texts.DIALOGUE_UNLOCKED.format(d_paid=config.DIALOGUE_MAX_PAID))
+
+
 @router.message(F.successful_payment)
-async def stars_paid(message: Message) -> None:
+async def stars_paid(message: Message, state: FSMContext) -> None:
     sp = message.successful_payment
     parts = (sp.invoice_payload or "").split(":")
     if len(parts) != 3 or parts[0] != "stars":
         return
     plan_key = parts[1]
-    if plan_key not in config.PLANS:
+    if config.plan(plan_key) is None:
         return
     uid = message.from_user.id
     is_new = await db.create_payment_row(
@@ -1102,8 +1351,7 @@ async def stars_paid(message: Message) -> None:
         float(sp.total_amount), sp.currency or "XTR", "stars", "succeeded",
     )
     if is_new:
-        await db.apply_purchase(uid, plan_key)
-        await message.answer(texts.PAY_SUCCESS[plan_key], reply_markup=kb.main_menu())
+        await _after_purchase(message.bot, message.chat.id, uid, plan_key, state)
     else:
         await message.answer(texts.PAY_ALREADY, reply_markup=kb.main_menu())
 
@@ -1137,7 +1385,7 @@ async def cb_pay_card(call: CallbackQuery) -> None:
 
 
 @router.callback_query(F.data.startswith("check_pay:"))
-async def cb_check_pay(call: CallbackQuery) -> None:
+async def cb_check_pay(call: CallbackQuery, state: FSMContext) -> None:
     payment_id = call.data.split(":", 1)[1]
     row = await db.get_payment(payment_id)
     if row is None or row["user_id"] != call.from_user.id:
@@ -1154,9 +1402,8 @@ async def cb_check_pay(call: CallbackQuery) -> None:
     await _ack(call)
     if st == "succeeded":
         if await db.mark_succeeded_once(payment_id):
-            await db.apply_purchase(row["user_id"], row["plan"])
-            await call.message.answer(texts.PAY_SUCCESS[row["plan"]],
-                                      reply_markup=kb.main_menu())
+            await _after_purchase(
+                call.bot, call.message.chat.id, row["user_id"], row["plan"], state)
         else:
             await call.message.answer(texts.PAY_ALREADY, reply_markup=kb.main_menu())
     elif st == "canceled":
@@ -1204,8 +1451,19 @@ async def broadcast_cancel(call: CallbackQuery, state: FSMContext) -> None:
 # ---------- Фолбэки (в самом конце — ловят всё остальное) ----------
 
 @router.message(StateFilter(None), F.text)
-async def fallback_text(message: Message) -> None:
+async def fallback_text(message: Message, state: FSMContext, bot: Bot) -> None:
     await _ensure_user(message)
+    # Она отвечает на наш вопрос по бандлу — свободным текстом, а не кнопкой.
+    # Это основной путь: кнопка «Просто разложи» нужна тем, кто рассказывать
+    # не хочет.
+    step = await db.awaiting_step(message.from_user.id)
+    if step is not None:
+        text = (message.text or "").strip()[:600]
+        if len(text) >= 2:
+            if await _run_bundle_step(
+                    bot, message.from_user.id, message.chat.id,
+                    step["id"], text, state):
+                return
     await message.answer(texts.FALLBACK_TEXT, reply_markup=kb.main_menu())
 
 

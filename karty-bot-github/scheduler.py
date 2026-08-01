@@ -11,9 +11,12 @@ from zoneinfo import ZoneInfo
 from aiogram import Bot
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
+import bundle_run
+import bundles
 import cards
 import config
 import database as db
+import delivery
 import keyboards as kb
 import llm
 import prompts
@@ -229,6 +232,58 @@ async def week_serial_job(bot: Bot) -> None:
         log.info("week serial sent to %s users", sent)
 
 
+async def bundle_job(bot: Bot) -> None:
+    """Шаги бандлов. Два прохода, и порядок важен.
+
+    Сначала — просроченные: про них уже спрашивали вчера и раньше, ответа нет.
+    Раскладываем без ответа. Разбор не должен вставать из-за её молчания:
+    пустота — это тоже факт, а не сбой сценария.
+
+    Потом — те, до которых дошла дата: задаём один вопрос про маркер и ждём
+    до завтра. Ответит текстом или кнопкой — расклад придёт сразу, поймает
+    его бот; не ответит — заберёт первый проход следующим утром."""
+    today = _today_msk()
+
+    # Оплачен, но не начат. Тут не про удержание, а про честность: человек
+    # отдал деньги и пока не получил ничего. Напоминаем один раз.
+    for r in await db.unstarted_bundles():
+        b = bundles.get(r["kind"])
+        if not b:
+            continue
+        try:
+            await delivery.send_offer_photo(bot, r["user_id"], b["img"])
+            await bot.send_message(
+                r["user_id"],
+                texts.BUNDLE_NOT_STARTED.format(
+                    name=esc(r["name"]), title=esc(b["title"])),
+                reply_markup=kb.bundle_start(r["id"]),
+            )
+        except Exception:  # noqa: BLE001 — заблокировали бота и т.п.
+            pass
+        finally:
+            await db.mark_bundle_reminded(r["id"])
+        await asyncio.sleep(0.05)
+
+    overdue = await db.overdue_bundle_steps(today)
+    for r in overdue:
+        try:
+            await bundle_run.run_step(bot, r["user_id"], r["user_id"], r)
+        except Exception as e:  # noqa: BLE001 — один сорванный шаг не должен
+            log.error("просроченный шаг %s не выдан: %s", r["id"], e)
+        await asyncio.sleep(0.2)
+
+    due = await db.due_bundle_steps(today)
+    for r in due:
+        try:
+            await bundle_run.ask_step(bot, r)
+        except Exception as e:  # noqa: BLE001 — заблокировали бота и т.п.
+            log.warning("шаг %s не спрошен: %s", r["id"], e)
+        await asyncio.sleep(0.2)
+
+    if overdue or due:
+        log.info("бандлы: выдано без ответа %s, спрошено %s", len(overdue), len(due))
+
+
 async def followup_job(bot: Bot) -> None:
     """Через FOLLOWUP_DAYS дней после последнего расклада — тёплое «как всё сложилось?».
 
@@ -297,6 +352,11 @@ def setup(bot: Bot) -> AsyncIOScheduler:
     # «Неделя»-сериал — следом за картой дня, чтобы утро складывалось в ритуал
     scheduler.add_job(week_serial_job, "cron", hour=config.DAILY_HOUR, minute=2,
                       args=[bot], id="week_serial")
+    # Шаги бандлов — заметно позже утренней рассылки: письмо «как прошла
+    # неделя?» не должно приходить одновременно с картой дня, иначе два
+    # сообщения подряд читаются как спам, а не как забота
+    scheduler.add_job(bundle_job, "cron", hour=config.DAILY_HOUR + 2, minute=0,
+                      args=[bot], id="bundles")
     scheduler.add_job(followup_job, "interval", hours=1, args=[bot], id="followups")
     if config.FREE_WEEKLY_TOPUP > 0 and config.FREE_TOPUP_CAP > 0:
         # Недельное пополнение бесплатных раскладов — раз в неделю, днём

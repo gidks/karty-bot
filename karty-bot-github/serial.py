@@ -35,6 +35,7 @@ def parse(text: str, n_cards: int) -> dict | None:
     intro: str | None = None
     summary: str | None = None
     chips_raw: str | None = None
+    marker: str | None = None
 
     for i, m in enumerate(matches):
         start = m.end()
@@ -53,6 +54,12 @@ def parse(text: str, n_cards: int) -> dict | None:
             summary = body
         elif name in ("ПОДСКАЗКИ", "ПОДСКАЗКА", "CHIPS"):
             chips_raw = body
+        elif name in ("МАРКЕР", "MARKER"):
+            # Маркер наблюдения в бандле: одна фраза, за чем смотреть до
+            # следующего шага. Ставим его отдельным блоком, а не хвостом итога,
+            # чтобы бот мог показать его особо и сохранить для следующего
+            # расклада. Многострочный ответ модели сжимаем в одну строку.
+            marker = " ".join(body.split()) or None
         # незнакомые блоки молча пропускаем
 
     # Все карты на месте и непустые?
@@ -75,6 +82,7 @@ def parse(text: str, n_cards: int) -> dict | None:
         "cards": [cards[i] for i in range(1, n_cards + 1)],
         "summary": summary or None,
         "chips": _parse_chips(chips_raw),
+        "marker": marker,
     }
 
 
@@ -109,4 +117,8 @@ def plain_text(parsed: dict, labels: list[str] | None = None) -> str:
             parts.append(body)
     if parsed.get("summary"):
         parts.append(parsed["summary"])
+    if parsed.get("marker"):
+        # Маркер идёт в сохранённый текст: следующий шаг бандла раскладывает
+        # именно на том, сбылся он или нет, и должен видеть исходную формулировку
+        parts.append(parsed["marker"])
     return "\n\n".join(parts)
