@@ -130,6 +130,7 @@ def _paywall_text(row) -> str:
         topup=texts.topup_promise(),
         pack_n=config.PACK_READINGS,
         p_pack=config.PRICE_PACK_RUB,
+        p_per=config.PRICE_PACK_RUB // max(config.PACK_READINGS, 1),
         p_single=config.PRICE_SINGLE_RUB,
         d_paid=config.DIALOGUE_MAX_PAID,
         d_free=config.DIALOGUE_MAX,
@@ -320,10 +321,10 @@ async def cb_new_reading(call: CallbackQuery, state: FSMContext) -> None:
         await call.message.answer(_paywall_text(row), reply_markup=kb.pack_offer())
         if bundles.on_sale():
             await call.message.answer(
-                texts.SPREAD_MENU, reply_markup=await _spreads_kb(uid, row))
+                texts.spread_menu(), reply_markup=await _spreads_kb(uid, row))
         return
     await call.message.answer(
-        texts.SPREAD_MENU, reply_markup=await _spreads_kb(uid, row))
+        texts.spread_menu(), reply_markup=await _spreads_kb(uid, row))
 
 
 @router.callback_query(F.data.startswith("spread:"))
@@ -887,8 +888,13 @@ async def _offer_after_rate(call: CallbackQuery, reading_id: int) -> None:
         b = bundles.get(key)
         await delivery.send_offer(
             call.bot, call.message.chat.id, b["img"],
+            # Короткая версия, а не полный экран: она только что нажала
+            # «Попало», внимания хватит на несколько строк, а не на
+            # спецификацию продукта. Полный разбор — по кнопке.
             texts.OFFER_ON_RATE_BUNDLE.format(
-                about=texts.BUNDLE_ABOUT[key], price=config.PRICE_BUNDLE_RUB),
+                about=texts.BUNDLE_ABOUT_SHORT.get(key, texts.BUNDLE_ABOUT[key]),
+                emoji=b["emoji"], title=b["title"],
+                price=config.PRICE_BUNDLE_RUB),
             kb.bundle_offer(key, back="menu"),
         )
         return

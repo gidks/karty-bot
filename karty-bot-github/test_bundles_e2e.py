@@ -13,8 +13,15 @@
 
 import asyncio
 import os
+import random
 import sys
 import tempfile
+
+# Карты в прогоне тянутся настоящие, то есть случайные. Проверка «в письмо
+# уехала повторяющаяся карта» проходила через раз: повтор в четырёх раскладах
+# из 78 карт — дело случая. Фиксируем зерно, иначе тест врёт примерно в каждом
+# пятом запуске и приучает не смотреть на красное.
+random.seed(20260801)
 
 os.environ.setdefault("BOT_TOKEN", "test")
 os.environ.setdefault("LLM_API_KEY", "test")
